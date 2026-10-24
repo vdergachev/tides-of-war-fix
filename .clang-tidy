@@ -1,0 +1,21 @@
+# bugprone-easily-swappable-parameters: Win32-style APIs use repeated scalar/pointer types.
+# bugprone-reserved-identifier: Win32 calling conventions and SDK names use reserved spellings.
+# clang-analyzer-security.insecureAPI.*: checked Win32/CRT buffer operations are intentional.
+# bugprone-casting-through-void: generic Win32 addresses require void pointer conversions.
+# bugprone-multi-level-implicit-pointer-conversion: Win32 output parameters use SDK pointer aliases.
+# clang-analyzer-valist.Uninitialized: MSVC x86 va_start uses an unmodeled compiler intrinsic.
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  readability-isolate-declaration,
+  readability-braces-around-statements,
+  readability-misleading-indentation,
+  misc-redundant-expression,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  -clang-analyzer-security.insecureAPI.*,
+  -bugprone-casting-through-void,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -clang-analyzer-valist.Uninitialized
+WarningsAsErrors: '*'
