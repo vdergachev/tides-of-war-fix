@@ -34,6 +34,7 @@ Target: Windows 7 SP1+ (`_WIN32_WINNT=0x0601`, `/SUBSYSTEM:…,6.01`), static CR
 | `src/dll/game_folder.c` | game folder from the EXE path (no SUBST) |
 | `src/dll/saves.c`, `registry.c` | saves in `saves\`, MFC profile in `saves\settings.ini`, no registry writes |
 | `src/dll/startup_warning.c`, `game_speed.c`, `draw_sync.c` | Windows 95 warning, game pace, draw after each step |
+| `src/dll/idle_wait.c` | wait for messages instead of busy-polling an empty queue |
 | `src/dll/d3d_fix.c` | Direct3D RGB device and white LVERTEX diffuse (textured ships) |
 | `src/dll/scaling.c`, `display.c` | integer scaling, mouse/dialog/font/cursor mapping, borderless fullscreen |
 | `src/patcher/tow_patch.c` | patcher (console and double-click dialog modes) |

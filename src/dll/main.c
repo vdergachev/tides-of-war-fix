@@ -9,12 +9,13 @@
 #include "startup_warning.h"
 #include "game_speed.h"
 #include "draw_sync.h"
+#include "idle_wait.h"
 #include "d3d_fix.h"
 #include "scale.h"
 #include "display.h"
 #include "../common/sha256.h"
 
-#define TOW_FIX_VERSION "0.13.2"
+#define TOW_FIX_VERSION "0.14.0"
 
 /* Supported game image and CRT entry point, before any game initialization. */
 #define GAME_IMAGE_BASE    0x400000
@@ -103,6 +104,8 @@ typedef struct {
     int startup_warning;
     int game_speed;
     int draw_sync;
+    int idle_wait;
+    int max_wait_ms;
     int rgb_device;
     int white_diffuse;
     int borderless_fullscreen;
@@ -133,6 +136,15 @@ static int read_settings(const char *dir, tow_settings *settings)
     log_line("[game_speed] percent=%d", settings->game_speed);
     settings->draw_sync = (int)GetPrivateProfileIntA("draw_sync", "enabled", 0, path);
     log_line("[draw_sync] enabled=%d", settings->draw_sync);
+    settings->idle_wait = (int)GetPrivateProfileIntA("idle_wait", "enabled", 0, path);
+    log_line("[idle_wait] enabled=%d", settings->idle_wait);
+    settings->max_wait_ms = (int)GetPrivateProfileIntA("idle_wait", "max_wait_ms", 10, path);
+    if (settings->max_wait_ms < 1) {
+        settings->max_wait_ms = 1;
+    } else if (settings->max_wait_ms > 100) {
+        settings->max_wait_ms = 100;
+    }
+    log_line("[idle_wait] max_wait_ms=%d", settings->max_wait_ms);
     settings->rgb_device = (int)GetPrivateProfileIntA("rgb_device", "enabled", 0, path);
     log_line("[rgb_device] enabled=%d", settings->rgb_device);
     settings->white_diffuse = (int)GetPrivateProfileIntA("white_diffuse", "enabled", 0, path);
@@ -189,6 +201,10 @@ static void __cdecl tow_init(void)
     log_line("draw_sync: %s", settings.draw_sync ? "enabled" : "disabled");
     if (settings.draw_sync) {
         draw_sync_apply();
+    }
+    log_line("idle_wait: %s", settings.idle_wait ? "enabled" : "disabled");
+    if (settings.idle_wait) {
+        idle_wait_apply((unsigned)settings.max_wait_ms);
     }
     log_line("rgb_device: %s", settings.rgb_device ? "enabled" : "disabled");
     log_line("white_diffuse: %s", settings.white_diffuse ? "enabled" : "disabled");

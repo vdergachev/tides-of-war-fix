@@ -13,6 +13,7 @@ Not affiliated with the original developers or publisher. The fix contains only 
 - **Starts from its own folder** by double-click — no `SUBST` drive and no compatibility settings needed.
 - **Saves and settings next to the game** (`saves\`), nothing is written to the registry or to Program Files.
 - **Smooth motion** of other ships (each game step is drawn right away) and a configurable **game pace**.
+- **No more 100% CPU core load:** the game sleeps while it waits for messages instead of busy-polling.
 - The "designed for Windows 95" warning is skipped.
 
 Every fix can be switched off in `tow_fix.ini`.
@@ -57,6 +58,7 @@ For reference, the main keys (`1` = on, `0` = off):
 | `[scaling]` | `fullscreen` | `borderless` | in-game fullscreen option: `borderless` or `off` (always windowed) |
 | `[game_speed]` | `percent` | `80` | game pace, 100 = original 62 ms step |
 | `[rgb_device]`, `[white_diffuse]` | `enabled` | `1` | textured ships |
+| `[idle_wait]` | `enabled` | `1` | sleep instead of busy-polling (CPU load) |
 | `[save_redirect]`, `[registry_guard]` | `enabled` | `1` | saves and settings in `saves\`, no registry writes |
 
 A log is written to `tow_fix.log` next to `TOW.exe`; please attach it to bug reports.

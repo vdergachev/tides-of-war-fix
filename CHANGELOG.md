@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.14.0
+
+- No more 100% load of one CPU core: the game's own message loop busy-polled an empty queue;
+  it now sleeps until the next message or timer (`[idle_wait]`, at most `max_wait_ms` = 10 ms per wait).
+
 ## 0.13.2 — first public version
 
 - Patcher `tow_patch.exe`: version check by SHA-256, backup `TOW.exe.bak`, import of `tow_fix.dll`,
