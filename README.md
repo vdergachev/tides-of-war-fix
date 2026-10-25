@@ -43,7 +43,13 @@ From a command prompt: `tow_patch.exe [--check | --restore] [path\to\TOW.exe]`.
 
 ## Settings
 
-`tow_fix.ini` next to `TOW.exe`; `1` = on, `0` = off. Main keys:
+**Nothing has to be configured — everything is already enabled and tested.**
+Do not edit `tow_fix.ini` unless you know what you are doing: a wrong value can bring back red ships or break the
+interface. If something breaks, take `tow_fix.ini` from the release archive again.
+
+Safe to change: `[game_speed] percent` (game pace) and `[scaling] factor` (zoom).
+
+For reference, the main keys (`1` = on, `0` = off):
 
 | Section | Key | Default | Meaning |
 |---|---|---|---|
