@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.15.0
+
+- Direct3D 11 output in a child window with vsync, with GDI fallback.
+- Smooth mission scenes at the monitor refresh rate: sea, coasts, hulls, masts and sails, effects, and clouds are
+  interpolated between game steps.
+- Clouds are drawn from the game's own art; masts and booms keep their colour.
+- `[d3d11] enabled`, `smooth`, and `warp` settings can switch the path off or control its fallback.
+
 ## 0.14.0
 
 - No more 100% load of one CPU core: the game's own message loop busy-polled an empty queue;

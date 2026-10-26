@@ -6,6 +6,7 @@
 #include "iat.h"
 #include "patch.h"
 #include "log.h"
+#include "d3d11_out.h"
 
 /* Verified presentation call and BitBlt import in the supported TOW.exe. */
 #define COPY_CALL_RVA         0x1757b
@@ -98,6 +99,7 @@ static int position_target(scale_target *target);
 static int layout_position(scale_target *target, WINDOWPOS *position);
 static void sync_backdrop(scale_target *target);
 static int apply_borderless(scale_target *target);
+static BOOL WINAPI copy_blit(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop);
 
 static scale_child *find_child(HWND hwnd)
 {
@@ -729,6 +731,10 @@ static scale_child *register_child(HWND hwnd, const int rect[4])
 
 static void scale_child_window(HWND hwnd)
 {
+    /* Our physical output HWND must never enter the game's scaling registry. */
+    if (d3d11_out_owns(hwnd)) {
+        return;
+    }
     WCHAR name[64];
     if (find_target(hwnd) || (GetClassNameW(hwnd, name, ARRAYSIZE(name)) && wcscmp(name, L"#32770") == 0)) {
         return;
@@ -1080,6 +1086,7 @@ static void sync_backdrop(scale_target *target)
  * The compiler preserves callee-saved registers and pops the four arguments. */
 static LRESULT CALLBACK scale_window_proc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp)
 {
+    d3d11_out_window(hwnd, message);
     scale_target *target = find_target(hwnd);
     if (!target) {
         return DefWindowProcW(hwnd, message, wp, lp);
@@ -1495,6 +1502,17 @@ static BOOL draw_frame(scale_target *target, HDC dst, HDC src, int sx, int sy, D
 static BOOL WINAPI frame_blit(HDC dst, int x, int y, int width, int height, HDC src, int sx, int sy,
                               DWORD rop)
 {
+    if (!g_drawing &&
+        (x || y || sx || sy || width != LOGICAL_WIDTH || height != LOGICAL_HEIGHT || rop != SRCCOPY)) {
+        d3d11_out_hide();
+    }
+    if (!g_factor && !g_drawing && x == 0 && y == 0 && sx == 0 && sy == 0 && width == LOGICAL_WIDTH &&
+        height == LOGICAL_HEIGHT && rop == SRCCOPY && d3d11_out_frame(WindowFromDC(dst), src, 1)) {
+        return TRUE;
+    }
+    if (!g_factor) {
+        return g_bitblt(dst, x, y, width, height, src, sx, sy, rop);
+    }
     if (!g_drawing && x == 0 && y == 0 && width == LOGICAL_WIDTH && height == LOGICAL_HEIGHT &&
         rop == SRCCOPY) {
         BOOL ok = FALSE;
@@ -1504,6 +1522,12 @@ static BOOL WINAPI frame_blit(HDC dst, int x, int y, int width, int height, HDC 
             if (hwnd) {
                 scale_target *target = ensure_target(hwnd, 0);
                 if (target) {
+                    /* D3D owns only a full qualifying Surface_Present frame. The
+                     * existing GDI branches and child sweep remain the fallback. */
+                    if (sx == 0 && sy == 0 && d3d11_out_frame(hwnd, src, g_factor)) {
+                        sweep_children(GetAncestor(hwnd, GA_ROOT));
+                        return TRUE;
+                    }
                     if (transformed_dc(dst)) {
                         ok = g_bitblt(dst, x, y, width, height, src, sx, sy, rop);
                         sweep_children(GetAncestor(hwnd, GA_ROOT));
@@ -1929,6 +1953,26 @@ void scaling_apply(const char *dir)
             install_stage4();
             install_window_diagnostics();
         }
+    } else if (d3d11_out_enabled()) {
+        /* Unscaled output needs only the verified presentation call, no UI hooks. */
+        DWORD *slot = iat_find_slot("gdi32.dll", "BitBlt");
+        if (slot && (uintptr_t)slot == BITBLT_SLOT_ADDRESS && *slot) {
+            BYTE expected[6] = {0xff, 0x15};
+            DWORD address = BITBLT_SLOT_ADDRESS;
+            memcpy(expected + 2, &address, sizeof(address));
+            g_bitblt = (bitblt_fn)(uintptr_t)*slot;
+            const DWORD calls[] = {FRAME_CALL_RVA, COPY_CALL_RVA};
+            const bitblt_fn hooks[] = {frame_blit, copy_blit};
+            for (unsigned i = 0; i < ARRAYSIZE(calls); ++i) {
+                BYTE *site = (BYTE *)(uintptr_t)(GAME_BASE + calls[i]);
+                BYTE call[6] = {0xe8, 0, 0, 0, 0, 0x90};
+                DWORD relative = (DWORD)(uintptr_t)hooks[i] - (DWORD)(uintptr_t)site - 5;
+                memcpy(call + 1, &relative, sizeof(relative));
+                if (!patch_write(site, expected, call, sizeof(call))) {
+                    scale_error(NULL, "unscaled presentation patch");
+                }
+            }
+        }
     }
 }
 
@@ -2345,6 +2389,10 @@ static void install_mfc40(void)
 static BOOL WINAPI copy_blit(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop)
 {
     if (g_drawing) {
+        return g_bitblt(dst, x, y, w, h, src, sx, sy, rop);
+    }
+    d3d11_out_hide();
+    if (!g_factor) {
         return g_bitblt(dst, x, y, w, h, src, sx, sy, rop);
     }
     BOOL ok = FALSE;

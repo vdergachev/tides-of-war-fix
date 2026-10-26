@@ -4,6 +4,7 @@
 #include "log.h"
 
 static FILE *g_log;
+static SRWLOCK g_log_lock = SRWLOCK_INIT;
 
 int log_open(const char *path)
 {
@@ -15,6 +16,7 @@ void log_line(const char *format, ...)
     if (!g_log) {
         return;
     }
+    AcquireSRWLockExclusive(&g_log_lock);
     SYSTEMTIME t;
     GetLocalTime(&t);
     fprintf(g_log, "[%02u:%02u:%02u.%03u] ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
@@ -24,4 +26,5 @@ void log_line(const char *format, ...)
     va_end(args);
     fputc('\n', g_log);
     fflush(g_log);
+    ReleaseSRWLockExclusive(&g_log_lock);
 }

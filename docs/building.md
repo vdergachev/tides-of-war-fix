@@ -36,8 +36,13 @@ Target: Windows 7 SP1+ (`_WIN32_WINNT=0x0601`, `/SUBSYSTEM:…,6.01`), static CR
 | `src/dll/startup_warning.c`, `game_speed.c`, `draw_sync.c` | Windows 95 warning, game pace, draw after each step |
 | `src/dll/idle_wait.c` | wait for messages instead of busy-polling an empty queue |
 | `src/dll/d3d_fix.c` | Direct3D RGB device and white LVERTEX diffuse (textured ships) |
+| `src/dll/d3d11_out.c`, `d3d11_out.h`, `d3d11_out.hlsl`, `d3d11_vs.h`, `d3d11_ps.h` | Direct3D 11 child-window output, vsync, shaders, and GDI fallback |
+| `src/dll/scene.c`, `scene.h`, `scene_gpu.c`, `scene_gpu.h`, `scene_vs.h`, `scene_vs.hlsl`, `scene_base_ps.h`, `scene_base_ps.hlsl` | mission-scene capture and interpolation between game steps |
+| `src/dll/cloud_art.c`, `cloud_art.h` | cloud sprites from the game's own art |
 | `src/dll/scaling.c`, `display.c` | integer scaling, mouse/dialog/font/cursor mapping, borderless fullscreen |
 | `src/patcher/tow_patch.c` | patcher (console and double-click dialog modes) |
+
+The DLL links `d3d11.lib` and `dxgi.lib` in addition to the existing Windows libraries.
 
 ## Code style
 

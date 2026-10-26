@@ -13,9 +13,10 @@
 #include "d3d_fix.h"
 #include "scale.h"
 #include "display.h"
+#include "d3d11_out.h"
 #include "../common/sha256.h"
 
-#define TOW_FIX_VERSION "0.14.0"
+#define TOW_FIX_VERSION "0.15.0"
 
 /* Supported game image and CRT entry point, before any game initialization. */
 #define GAME_IMAGE_BASE    0x400000
@@ -108,6 +109,7 @@ typedef struct {
     int max_wait_ms;
     int rgb_device;
     int white_diffuse;
+    DWORD untextured_color;
     int borderless_fullscreen;
     int restore_on_exit;
 } tow_settings;
@@ -149,6 +151,12 @@ static int read_settings(const char *dir, tow_settings *settings)
     log_line("[rgb_device] enabled=%d", settings->rgb_device);
     settings->white_diffuse = (int)GetPrivateProfileIntA("white_diffuse", "enabled", 0, path);
     log_line("[white_diffuse] enabled=%d", settings->white_diffuse);
+    settings->untextured_color = GetPrivateProfileIntA("white_diffuse", "untextured_color", 0x503820, path);
+    if (settings->untextured_color > 0xffffffUL) {
+        log_line("white_diffuse: invalid untextured_color; using 0x503820");
+        settings->untextured_color = 0x503820;
+    }
+    log_line("[white_diffuse] untextured_color=0x%06lx", settings->untextured_color);
     char fullscreen[32];
     GetPrivateProfileStringA("scaling", "fullscreen", "borderless", fullscreen, sizeof(fullscreen), path);
     settings->borderless_fullscreen = _stricmp(fullscreen, "off") != 0;
@@ -209,8 +217,9 @@ static void __cdecl tow_init(void)
     log_line("rgb_device: %s", settings.rgb_device ? "enabled" : "disabled");
     log_line("white_diffuse: %s", settings.white_diffuse ? "enabled" : "disabled");
     if (settings.rgb_device || settings.white_diffuse) {
-        d3d_fix_apply(settings.rgb_device, settings.white_diffuse);
+        d3d_fix_apply(settings.rgb_device, settings.white_diffuse, settings.untextured_color);
     }
+    d3d11_out_configure(dir);
     scaling_apply(dir);
     display_apply(settings.borderless_fullscreen, settings.restore_on_exit);
 }
