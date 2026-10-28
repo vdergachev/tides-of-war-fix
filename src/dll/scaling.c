@@ -1,11 +1,13 @@
 #include <windows.h>
 #include <stdint.h>
 #include <limits.h>
+#include <intrin.h>
 #include <string.h>
 #include "scale.h"
 #include "iat.h"
 #include "patch.h"
 #include "log.h"
+#include "diag.h"
 #include "d3d11_out.h"
 
 /* Verified presentation call and BitBlt import in the supported TOW.exe. */
@@ -32,10 +34,34 @@
 #define CWND_HWND_OFFSET 0x20
 #define DRAG_MOVE_RVA    0x48d60
 #define DRAG_UP_RVA      0x48e20
+/* CDlgYesNo 158 -> MFC42 #4299, CWnd::MoveWindow; site RECT verified at +0x30. */
+#define YES_MOVE_ADDRESS        0x425bdd
+#define NO_MOVE_ADDRESS         0x425cad
+#define MFC_MOVE_THUNK          0x494526
+#define CWND_SITE_OFFSET        0x3c
+#define SITE_RECT_OFFSET        0x30
+#define SITE_MOVE_VTABLE_OFFSET 0xa0
 
 typedef BOOL(WINAPI *bitblt_fn)(HDC, int, int, int, int, HDC, int, int, DWORD);
 typedef BOOL(WINAPI *client_rect_fn)(HWND, LPRECT);
 typedef BOOL(WINAPI *dpi_aware_fn)(void);
+
+/* The DLL's own USER32 imports are intentionally not patched. */
+static BOOL scaling_set_window_pos(HWND hwnd, HWND after, int x, int y, int w, int h, UINT flags)
+{
+    if (diag_enabled(DIAG_UI)) {
+        diag_ui_own(1, _ReturnAddress(), hwnd, after, flags, x, y, w, h);
+    }
+    return SetWindowPos(hwnd, after, x, y, w, h, flags);
+}
+
+static BOOL scaling_show_window(HWND hwnd, int command)
+{
+    if (diag_enabled(DIAG_UI)) {
+        diag_ui_own(0, _ReturnAddress(), hwnd, NULL, (UINT)command, 0, 0, 0, 0);
+    }
+    return ShowWindow(hwnd, command);
+}
 
 typedef struct {
     HWND hwnd;
@@ -75,6 +101,7 @@ static int g_installed;
 static int g_dialogs;
 static int g_fonts;
 static int g_scale_cursor;
+static int g_soft_cursor_clip;
 static int g_dc_transform;
 static int g_dc_transform_controls;
 static void install_paint_imports(HMODULE module, unsigned index);
@@ -100,6 +127,8 @@ static int layout_position(scale_target *target, WINDOWPOS *position);
 static void sync_backdrop(scale_target *target);
 static int apply_borderless(scale_target *target);
 static BOOL WINAPI copy_blit(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop);
+static void yesno_layout(HWND dialog, const char *phase, const void *caller);
+static void install_yesno_diagnostics(void);
 
 static scale_child *find_child(HWND hwnd)
 {
@@ -109,6 +138,214 @@ static scale_child *find_child(HWND hwnd)
         }
     }
     return NULL;
+}
+
+static HWND g_yesno_dialog;
+static BYTE *g_yesno_controls[2];
+static DWORD g_mfc_move = MFC_MOVE_THUNK;
+static HWND g_diag_panel;
+static int g_yesno_painted;
+
+static void yesno_layout(HWND dialog, const char *phase, const void *caller)
+{
+    if (!diag_enabled(DIAG_YESNO) || !dialog || dialog != g_yesno_dialog) {
+        return;
+    }
+    DWORD error = GetLastError();
+    __try {
+        RECT parent = {0};
+        RECT client = {0};
+        GetWindowRect(dialog, &parent);
+        GetClientRect(dialog, &client);
+        for (unsigned i = 0; i < 2; ++i) {
+            BYTE *control = g_yesno_controls[i];
+            if (!control) {
+                continue;
+            }
+            HWND hwnd = *(HWND *)(control + CWND_HWND_OFFSET);
+            if (!IsWindow(hwnd) || GetParent(hwnd) != dialog) {
+                continue;
+            }
+            RECT rect = {0};
+            GetWindowRect(hwnd, &rect);
+            MapWindowPoints(NULL, dialog, (POINT *)&rect, 2);
+            RECT ole = {0};
+            BYTE *site = *(BYTE **)(control + CWND_SITE_OFFSET);
+            int ole_valid = 0;
+            if (site) {
+                BYTE *method = *(BYTE **)(*(BYTE **)(site) + SITE_MOVE_VTABLE_OFFSET);
+                /* Installed MFC42: MoveWindow loads m_rect with LEA EBX,[ECX+30h].
+                 * Reject other layouts instead of labelling arbitrary memory a RECT. */
+                static const BYTE prefix[] = {0x8b, 0xff, 0x55, 0x8b, 0xec, 0x83, 0xec, 0x14,
+                                              0x53, 0x56, 0x8b, 0x45, 0x14, 0x8d, 0x59, 0x30};
+                if (memcmp(method, prefix, sizeof(prefix)) == 0) {
+                    ole = *(RECT *)(site + SITE_RECT_OFFSET);
+                    ole_valid = 1;
+                }
+            }
+            scale_child *child = find_child(hwnd);
+            const int empty[4] = {0};
+            const int *logical = child ? child->logical : empty;
+            const int *physical = child ? child->physical : empty;
+            diag_line(DIAG_YESNO,
+                      "yesno_layout dialog=158 phase=%s id=%u hwnd=%p parent=(%ld,%ld,%ld,%ld) "
+                      "client=(%ld,%ld,%ld,%ld) child=(%ld,%ld,%ld,%ld) cached=%d logical_xywh=(%d,%d,%d,%d) "
+                      "physical_xywh=(%d,%d,%d,%d) site=%p ole_valid=%d ole=(%ld,%ld,%ld,%ld) caller=%p",
+                      phase, 1186 + i, (void *)hwnd, parent.left, parent.top, parent.right, parent.bottom,
+                      client.left, client.top, client.right, client.bottom, rect.left, rect.top, rect.right,
+                      rect.bottom, child != NULL, logical[0], logical[1], logical[2], logical[3], physical[0],
+                      physical[1], physical[2], physical[3], (void *)site, ole_valid, ole.left, ole.top,
+                      ole.right, ole.bottom, caller);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        diag_line(DIAG_YESNO, "yesno_layout phase=%s unreadable=1 caller=%p", phase, caller);
+    }
+    SetLastError(error);
+}
+
+/* After bridge: saved+11 = retained ECX, original return, five original arguments. */
+static void __stdcall yesno_after(const DWORD *saved)
+{
+    DWORD error = GetLastError();
+    __try {
+        BYTE *control = (BYTE *)saved[10];
+        DWORD caller = saved[11] - 5;
+        unsigned index = caller == YES_MOVE_ADDRESS ? 0 : 1;
+        HWND hwnd = *(HWND *)(control + CWND_HWND_OFFSET);
+        HWND parent = GetParent(hwnd);
+        if (parent != g_yesno_dialog) {
+            memset(g_yesno_controls, 0, sizeof(g_yesno_controls));
+            g_yesno_painted = 0;
+        }
+        g_yesno_dialog = parent;
+        diag_yesno_window(parent);
+        diag_yesno_imports(GetModuleHandleA("MFC40.DLL"), 2);
+        diag_yesno_imports(GetModuleHandleA("Anibtn32.ocx"), 3);
+        g_yesno_controls[index] = control;
+        yesno_layout(parent, index ? "after_425CAD" : "after_425BDD", (void *)(uintptr_t)caller);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        diag_line(DIAG_YESNO, "yesno_layout phase=move4299 unreadable=1");
+    }
+    SetLastError(error);
+}
+
+/* Before bridge: original ECX and caller are still in the untouched entry image. */
+static void __stdcall yesno_before(const DWORD *saved)
+{
+    DWORD error = GetLastError();
+    __try {
+        BYTE *control = (BYTE *)saved[6];
+        DWORD caller = saved[10] - 5;
+        unsigned index = caller == YES_MOVE_ADDRESS ? 0 : 1;
+        HWND hwnd = *(HWND *)(control + CWND_HWND_OFFSET);
+        HWND parent = GetParent(hwnd);
+        if (parent != g_yesno_dialog) {
+            memset(g_yesno_controls, 0, sizeof(g_yesno_controls));
+            g_yesno_painted = 0;
+        }
+        g_yesno_dialog = parent;
+        diag_yesno_window(parent);
+        diag_yesno_imports(GetModuleHandleA("MFC40.DLL"), 2);
+        diag_yesno_imports(GetModuleHandleA("Anibtn32.ocx"), 3);
+        g_yesno_controls[index] = control;
+        yesno_layout(parent, "before_move4299", (void *)(uintptr_t)caller);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        diag_line(DIAG_YESNO, "yesno_layout phase=before_move4299 unreadable=1");
+    }
+    SetLastError(error);
+}
+
+/* Five copied arguments go to the original #4299 path. RET 20 consumes originals.
+ * Observer preserves all result GPRs, flags, x87/SSE and exact original ESP. */
+// clang-format off
+__declspec(naked) static void yesno_before_bridge(void)
+{
+    __asm {
+        pushfd
+        pushad
+        mov eax, esp
+        sub esp, 528
+        and esp, -16
+        fxsave [esp]
+        fninit
+        push 1f80h
+        ldmxcsr [esp]
+        add esp, 4
+        push eax
+        push eax
+        cld
+        call yesno_before
+        pop eax
+        fxrstor [esp]
+        mov esp, eax
+        popad
+        popfd
+        ret
+    }
+}
+
+__declspec(naked) static void yesno_after_bridge(void)
+{
+    __asm {
+        pushfd
+        pushad
+        mov eax, esp
+        sub esp, 528
+        and esp, -16
+        fxsave [esp]
+        fninit
+        push 1f80h
+        ldmxcsr [esp]
+        add esp, 4
+        push eax
+        push eax
+        cld
+        call yesno_after
+        pop eax
+        fxrstor [esp]
+        mov esp, eax
+        popad
+        popfd
+        ret
+    }
+}
+
+__declspec(naked) static void yesno_move_thunk(void)
+{
+    __asm {
+        call yesno_before_bridge
+        push ecx
+        push dword ptr [esp + 24]
+        push dword ptr [esp + 24]
+        push dword ptr [esp + 24]
+        push dword ptr [esp + 24]
+        push dword ptr [esp + 24]
+        call dword ptr [g_mfc_move]
+        call yesno_after_bridge
+        lea esp, [esp + 4]
+        ret 20
+    }
+}
+
+// clang-format on
+
+static void install_yesno_diagnostics(void)
+{
+    const DWORD sites[] = {YES_MOVE_ADDRESS, NO_MOVE_ADDRESS};
+    BYTE expected[2][5];
+    for (unsigned i = 0; i < 2; ++i) {
+        expected[i][0] = 0xe8;
+        DWORD displacement = MFC_MOVE_THUNK - sites[i] - 5;
+        memcpy(expected[i] + 1, &displacement, 4);
+        if (!patch_check((void *)(uintptr_t)sites[i], expected[i], 5)) {
+            log_line("diag: yesno MoveWindow hook rejected caller=%08lx", sites[i]);
+            return;
+        }
+    }
+    for (unsigned i = 0; i < 2; ++i) {
+        int ok = patch_call((void *)(uintptr_t)sites[i], expected[i], (void *)(uintptr_t)yesno_move_thunk);
+        log_line("diag: yesno MoveWindow caller=%08lx installed=%d", sites[i], ok);
+    }
 }
 
 /* Bound diagnostics even when a rejected HWND is encountered on every frame. */
@@ -178,6 +415,19 @@ typedef BOOL(WINAPI *clip_cursor_fn)(const RECT *);
 static cursor_fn g_cursor;
 static set_cursor_fn g_set_cursor;
 static clip_cursor_fn g_clip_cursor;
+typedef BOOL(WINAPI *get_clip_fn)(LPRECT);
+static get_clip_fn g_get_clip;
+
+/* A saved mapping belongs only to the next ClipCursor on this thread. */
+static __declspec(thread) RECT g_saved_clip_logical;
+static __declspec(thread) RECT g_saved_clip_physical;
+static __declspec(thread) int g_saved_clip_valid;
+static __declspec(thread) POINT g_saved_clip_origin;
+static __declspec(thread) int g_saved_clip_scaled;
+static RECT g_last_clip_physical;
+static POINT g_last_clip_origin;
+static int g_last_clip_valid;
+static void *g_soft_clip_callers[64];
 
 /* Math.floor, including negatives and INT_MIN. */
 static int logical_coordinate(int value)
@@ -219,20 +469,150 @@ static BOOL WINAPI physical_cursor(int x, int y)
     return g_set_cursor(x, y);
 }
 
+static BOOL WINAPI logical_clip(LPRECT rect)
+{
+    g_saved_clip_valid = 0;
+    BOOL result = g_get_clip(rect);
+    DWORD error = GetLastError();
+    if (result && rect) {
+        RECT physical = *rect;
+        RECT screen = {GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), 0, 0};
+        screen.right = screen.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        screen.bottom = screen.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        POINT origin;
+        int active = active_origin(&origin);
+        int scaled = 0;
+        if (EqualRect(&physical, &screen)) {
+            /* Preserve the game's original full-display size test. */
+            SetRect(rect, 0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
+        } else {
+            if (g_last_clip_valid && EqualRect(&physical, &g_last_clip_physical)) {
+                origin = g_last_clip_origin;
+                active = 1;
+            }
+            if (active) {
+                scaled = 1;
+                rect->left = origin.x + logical_coordinate(physical.left - origin.x);
+                rect->top = origin.y + logical_coordinate(physical.top - origin.y);
+                rect->right = origin.x + logical_coordinate(physical.right - origin.x);
+                rect->bottom = origin.y + logical_coordinate(physical.bottom - origin.y);
+            }
+        }
+        g_saved_clip_logical = *rect;
+        g_saved_clip_physical = physical;
+        g_saved_clip_valid = 1;
+        g_saved_clip_origin = origin;
+        g_saved_clip_scaled = scaled;
+        diag_line(
+            DIAG_CURSOR,
+            "cursor_get_clip caller=%p N=%d rect=(%ld,%ld,%ld,%ld) physical=(%ld,%ld,%ld,%ld) result=%d",
+            (BYTE *)_ReturnAddress() - 6, g_factor, rect->left, rect->top, rect->right, rect->bottom,
+            physical.left, physical.top, physical.right, physical.bottom, result);
+    }
+    SetLastError(error);
+    return result;
+}
+
+static int widen_clip_axis(LONG *low, LONG *high, LONG current, LONG size)
+{
+    if (size < 0 || size > 4 || (current >= *low && current < *high)) {
+        return 0;
+    }
+    if (current < *low) {
+        *low = current;
+    }
+    if (current >= *high) {
+        /* The right/bottom edge is exclusive. */
+        *high = current + 1;
+    }
+    return 1;
+}
+
+static void soft_clip(RECT *physical, const RECT *logical, const void *caller)
+{
+    POINT cursor;
+    if (!g_soft_cursor_clip || !GetCursorPos(&cursor)) {
+        return;
+    }
+    int changed =
+        widen_clip_axis(&physical->left, &physical->right, cursor.x, logical->right - logical->left);
+    changed |= widen_clip_axis(&physical->top, &physical->bottom, cursor.y, logical->bottom - logical->top);
+    if (!changed) {
+        return;
+    }
+    for (unsigned i = 0; i < ARRAYSIZE(g_soft_clip_callers); ++i) {
+        if (g_soft_clip_callers[i] == caller) {
+            return;
+        }
+        if (!g_soft_clip_callers[i]) {
+            g_soft_clip_callers[i] = (void *)caller;
+            log_line(
+                "scaling: soft_cursor_clip caller=%p logical=(%ld,%ld,%ld,%ld) physical=(%ld,%ld,%ld,%ld)",
+                (const BYTE *)caller - 6, logical->left, logical->top, logical->right, logical->bottom,
+                physical->left, physical->top, physical->right, physical->bottom);
+            return;
+        }
+    }
+}
+
 static BOOL WINAPI physical_clip(const RECT *rect)
 {
     DWORD error = GetLastError();
+    void *caller = _ReturnAddress();
+    RECT input = {0};
+    POINT before = {0};
+    int diagnostic = diag_enabled(DIAG_CURSOR);
+    if (diagnostic) {
+        if (rect) {
+            input = *rect;
+        }
+        GetCursorPos(&before);
+    }
     POINT origin;
     RECT copy;
-    if (rect && active_origin(&origin)) {
+    int active = active_origin(&origin);
+    int restore = rect && g_saved_clip_valid && EqualRect(rect, &g_saved_clip_logical);
+    /* Consume on mismatch or failure too: later equal rectangles are new requests. */
+    g_saved_clip_valid = 0;
+    if (restore) {
+        copy = g_saved_clip_physical;
+        origin = g_saved_clip_origin;
+        active = g_saved_clip_scaled;
+        rect = &copy;
+    } else if (rect && active) {
         copy.left = origin.x + (rect->left - origin.x) * g_factor;
         copy.top = origin.y + (rect->top - origin.y) * g_factor;
         copy.right = origin.x + (rect->right - origin.x) * g_factor;
         copy.bottom = origin.y + (rect->bottom - origin.y) * g_factor;
+        soft_clip(&copy, rect, caller);
         rect = &copy;
     }
     SetLastError(error);
-    return g_clip_cursor(rect);
+    BOOL result = g_clip_cursor(rect);
+    error = GetLastError();
+    if (result) {
+        g_last_clip_valid = rect && active && GetClipCursor(&g_last_clip_physical);
+        g_last_clip_origin = origin;
+    }
+    SetLastError(error);
+    if (diagnostic) {
+        error = GetLastError();
+        POINT after = {0};
+        RECT output = {0};
+        GetCursorPos(&after);
+        GetClipCursor(&output);
+        HWND foreground = GetForegroundWindow();
+        diag_line(DIAG_CURSOR,
+                  "cursor_clip caller=%p N=%d foreground=%p root=%p panel=%p capture=%p null=%d "
+                  "input=(%ld,%ld,%ld,%ld) output=(%ld,%ld,%ld,%ld) cursor_before=(%ld,%ld) "
+                  "cursor_after=(%ld,%ld) result=%d",
+                  (BYTE *)caller - 6, g_factor, (void *)foreground, (void *)GetAncestor(foreground, GA_ROOT),
+                  (void *)g_diag_panel, (void *)GetCapture(), rect == NULL, input.left, input.top,
+                  input.right, input.bottom, output.left, output.top, output.right, output.bottom, before.x,
+                  before.y, after.x, after.y, result);
+        SetLastError(error);
+    }
+    return result;
 }
 
 static int scaled_view(HWND hwnd)
@@ -395,6 +775,10 @@ static LRESULT paint_message(WNDPROC previous, BOOL unicode, HWND hwnd, UINT mes
         }
         SetLastError(error);
     }
+    if (message == WM_PAINT && diag_enabled(DIAG_YESNO) && hwnd == g_yesno_dialog && !g_yesno_painted) {
+        g_yesno_painted = 1;
+        yesno_layout(hwnd, "first_WM_PAINT", (const void *)(uintptr_t)previous);
+    }
     return result;
 }
 
@@ -477,7 +861,18 @@ static const mouse_route g_mouse_routes[] = {
 static void dispatch_mouse(unsigned index, void *self, UINT flags, int x, int y)
 {
     DWORD error = GetLastError();
+    int input_x = x;
+    int input_y = y;
     const mouse_route *route = &g_mouse_routes[index];
+    int report = diag_enabled(DIAG_CURSOR);
+    if (report && route->message == WM_MOUSEMOVE) {
+        static DWORD last_move;
+        DWORD now = GetTickCount();
+        report = (DWORD)(now - last_move) >= 500;
+        if (report) {
+            last_move = now;
+        }
+    }
     if (route->handler_rva != DRAG_MOVE_RVA && route->handler_rva != DRAG_UP_RVA && self) {
         HWND hwnd = NULL;
         __try {
@@ -485,14 +880,31 @@ static void dispatch_mouse(unsigned index, void *self, UINT flags, int x, int y)
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             hwnd = NULL;
         }
+        if (diag_enabled(DIAG_CURSOR) && index >= 21 && index <= 24) {
+            g_diag_panel = hwnd;
+        }
         if (hwnd && scaled_view(hwnd)) {
             x = logical_coordinate(x);
             y = logical_coordinate(y);
         }
     }
+    if (report) {
+        diag_line(
+            DIAG_CURSOR,
+            "dispatch_mouse phase=in handler=%08lx message=%x self=%p N=%d input=(%d,%d) output=(%d,%d)",
+            GAME_BASE + route->handler_rva, route->message, self, g_factor, input_x, input_y, x, y);
+    }
     SetLastError(error);
     mouse_fn original = (mouse_fn)(uintptr_t)(GAME_BASE + route->handler_rva);
     original(self, NULL, flags, x, y);
+    if (report) {
+        error = GetLastError();
+        POINT point = {0};
+        GetCursorPos(&point);
+        diag_line(DIAG_CURSOR, "dispatch_mouse phase=out handler=%08lx cursor=(%ld,%ld) capture=%p",
+                  GAME_BASE + route->handler_rva, point.x, point.y, (void *)GetCapture());
+        SetLastError(error);
+    }
 }
 
 static int install_mouse_handlers(void)
@@ -526,9 +938,9 @@ static int install_mouse_handlers(void)
 
 static int install_mouse_apis(void)
 {
-    const char *names[] = {"GetCursorPos", "SetCursorPos", "ClipCursor"};
+    const char *names[] = {"GetCursorPos", "SetCursorPos", "ClipCursor", "GetClipCursor"};
     void *hooks[] = {(void *)(uintptr_t)logical_cursor, (void *)(uintptr_t)physical_cursor,
-                     (void *)(uintptr_t)physical_clip};
+                     (void *)(uintptr_t)physical_clip, (void *)(uintptr_t)logical_clip};
     unsigned installed = 0;
     for (unsigned i = 0; i < ARRAYSIZE(names); ++i) {
         DWORD *slot = iat_find_slot("user32.dll", names[i]);
@@ -541,8 +953,10 @@ static int install_mouse_apis(void)
             g_cursor = (cursor_fn)(uintptr_t)original;
         } else if (i == 1) {
             g_set_cursor = (set_cursor_fn)(uintptr_t)original;
-        } else {
+        } else if (i == 2) {
             g_clip_cursor = (clip_cursor_fn)(uintptr_t)original;
+        } else {
+            g_get_clip = (get_clip_fn)(uintptr_t)original;
         }
         int result = iat_replace(slot, original, hooks[i]);
         if (result != IAT_OK) {
@@ -767,8 +1181,8 @@ static void scale_child_window(HWND hwnd)
     }
     int previous = g_scaling_child;
     g_scaling_child = 1;
-    BOOL ok = SetWindowPos(hwnd, NULL, child->physical[0], child->physical[1], child->physical[2],
-                           child->physical[3], SWP_NOZORDER | SWP_NOACTIVATE);
+    BOOL ok = scaling_set_window_pos(hwnd, NULL, child->physical[0], child->physical[1], child->physical[2],
+                                     child->physical[3], SWP_NOZORDER | SWP_NOACTIVATE);
     g_scaling_child = previous;
     if (!ok) {
         scale_error(NULL, "child SetWindowPos");
@@ -806,6 +1220,9 @@ static void sweep_children(HWND root)
         }
     }
     walk_children(root, 1);
+    if (diag_enabled(DIAG_YESNO)) {
+        yesno_layout(root, "walk_children", NULL);
+    }
 }
 
 typedef BOOL(WINAPI *window_rect_fn)(HWND, LPRECT);
@@ -1048,7 +1465,7 @@ static void sync_backdrop(scale_target *target)
     }
     if (!target->fullscreen || IsIconic(target->hwnd) || !IsWindowVisible(target->hwnd)) {
         if (target->backdrop) {
-            ShowWindow(target->backdrop, SW_HIDE);
+            scaling_show_window(target->backdrop, SW_HIDE);
         }
         return;
     }
@@ -1062,22 +1479,23 @@ static void sync_backdrop(scale_target *target)
     info.cbSize = sizeof(info);
     HMONITOR monitor = MonitorFromWindow(target->hwnd, MONITOR_DEFAULTTONEAREST);
     if (!monitor || !GetMonitorInfoW(monitor, &info)) {
-        ShowWindow(target->backdrop, SW_HIDE);
+        scaling_show_window(target->backdrop, SW_HIDE);
         scale_error(target, "backdrop monitor");
         return;
     }
     LONG backdrop_topmost = GetWindowLongW(target->backdrop, GWL_EXSTYLE) & WS_EX_TOPMOST;
     if (backdrop_topmost) {
-        if (!SetWindowPos(target->backdrop, HWND_NOTOPMOST, 0, 0, 0, 0,
-                          SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE)) {
+        if (!scaling_set_window_pos(target->backdrop, HWND_NOTOPMOST, 0, 0, 0, 0,
+                                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE)) {
             scale_error(target, "backdrop topmost band");
             return;
         }
     }
     /* Both windows stay non-topmost; insert directly below the game without activation. */
-    if (!SetWindowPos(target->backdrop, target->hwnd, info.rcMonitor.left, info.rcMonitor.top,
-                      info.rcMonitor.right - info.rcMonitor.left, info.rcMonitor.bottom - info.rcMonitor.top,
-                      SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+    if (!scaling_set_window_pos(target->backdrop, target->hwnd, info.rcMonitor.left, info.rcMonitor.top,
+                                info.rcMonitor.right - info.rcMonitor.left,
+                                info.rcMonitor.bottom - info.rcMonitor.top,
+                                SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
         scale_error(target, "backdrop position");
     }
 }
@@ -1185,8 +1603,8 @@ static int drop_target_topmost(scale_target *target)
     }
     /* The nested WM_WINDOWPOSCHANGING must retain HWND_NOTOPMOST. */
     target->dropping_topmost = 1;
-    BOOL ok =
-        SetWindowPos(target->hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+    BOOL ok = scaling_set_window_pos(target->hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                                     SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
     target->dropping_topmost = 0;
     if (!ok) {
         return scale_error(target, "game topmost band");
@@ -1196,6 +1614,8 @@ static int drop_target_topmost(scale_target *target)
 
 static int layout_position(scale_target *target, WINDOWPOS *position)
 {
+    UINT original_flags = position->flags;
+    HWND original_after = position->hwndInsertAfter;
     if (target->dropping_topmost) {
         return 1;
     }
@@ -1238,6 +1658,10 @@ static int layout_position(scale_target *target, WINDOWPOS *position)
     }
     position->cx = target->width;
     position->cy = target->height;
+    if (diag_enabled(DIAG_UI)) {
+        diag_ui_scaling(target->hwnd, original_after, original_flags, position->hwndInsertAfter,
+                        position->flags);
+    }
     return 1;
 }
 
@@ -1256,8 +1680,8 @@ static int position_target(scale_target *target)
         return 0;
     }
     target->laying_out = 1;
-    BOOL ok = SetWindowPos(target->hwnd, position.hwndInsertAfter, position.x, position.y, position.cx,
-                           position.cy, position.flags);
+    BOOL ok = scaling_set_window_pos(target->hwnd, position.hwndInsertAfter, position.x, position.y,
+                                     position.cx, position.cy, position.flags);
     target->laying_out = 0;
     sync_backdrop(target);
     if (!ok) {
@@ -1469,6 +1893,96 @@ static int copy_update_region(scale_target *target, HDC original, HDC fresh)
     return ok ? 1 : scale_error(target, "copy update region");
 }
 
+static BOOL stretch_frame(HDC dst, HDC src, int sx, int sy, int factor, DWORD rop)
+{
+    int previous = SetStretchBltMode(dst, COLORONCOLOR);
+    if (!previous) {
+        return FALSE;
+    }
+    BOOL ok = StretchBlt(dst, 0, 0, LOGICAL_WIDTH * factor, LOGICAL_HEIGHT * factor, src, sx, sy,
+                         LOGICAL_WIDTH, LOGICAL_HEIGHT, rop);
+    if (!SetStretchBltMode(dst, previous)) {
+        scale_error(NULL, "restore stretch mode");
+    }
+    return ok;
+}
+
+typedef struct {
+    HDC dst;
+    HDC src;
+    HBITMAP bitmap;
+    HGDIOBJ previous;
+    void *bits;
+} refresh_surface;
+
+static int refresh_prepare(HWND hwnd, refresh_surface *surface)
+{
+    static const struct {
+        BITMAPINFOHEADER header;
+        DWORD masks[3];
+    } info = {{sizeof(BITMAPINFOHEADER), LOGICAL_WIDTH, -LOGICAL_HEIGHT, 1, 16, BI_BITFIELDS, 0, 0, 0, 0, 0},
+              {0xf800, 0x07e0, 0x001f}};
+
+    surface->dst = GetDC(hwnd);
+    if (!surface->dst) {
+        return 0;
+    }
+
+    surface->src = CreateCompatibleDC(NULL);
+    if (!surface->src) {
+        return 0;
+    }
+
+    surface->bitmap =
+        CreateDIBSection(surface->src, (const BITMAPINFO *)&info, DIB_RGB_COLORS, &surface->bits, NULL, 0);
+    if (!surface->bitmap) {
+        return 0;
+    }
+
+    surface->previous = SelectObject(surface->src, surface->bitmap);
+    return surface->previous && surface->previous != HGDI_ERROR;
+}
+
+static int refresh_blit(refresh_surface *surface, const void *pixels, int factor)
+{
+    memcpy(surface->bits, pixels, LOGICAL_WIDTH * LOGICAL_HEIGHT * 2);
+    int ok = stretch_frame(surface->dst, surface->src, 0, 0, factor, SRCCOPY);
+    /* Finish this thread's access before deleting the temporary DIB. */
+    GdiFlush();
+    return ok;
+}
+
+static void refresh_cleanup(HWND hwnd, refresh_surface *surface)
+{
+    if (surface->previous && surface->previous != HGDI_ERROR) {
+        SelectObject(surface->src, surface->previous);
+    }
+
+    if (surface->bitmap) {
+        DeleteObject(surface->bitmap);
+    }
+
+    if (surface->src) {
+        DeleteDC(surface->src);
+    }
+
+    if (surface->dst) {
+        ReleaseDC(hwnd, surface->dst);
+    }
+}
+
+int scaling_refresh_gdi(HWND hwnd, const void *pixels, int factor)
+{
+    refresh_surface surface = {0};
+    int ok = 0;
+    if (refresh_prepare(hwnd, &surface)) {
+        ok = refresh_blit(&surface, pixels, factor);
+    }
+
+    refresh_cleanup(hwnd, &surface);
+    return ok;
+}
+
 static BOOL draw_frame(scale_target *target, HDC dst, HDC src, int sx, int sy, DWORD rop)
 {
     HDC fresh = GetDC(target->hwnd);
@@ -1477,18 +1991,9 @@ static BOOL draw_frame(scale_target *target, HDC dst, HDC src, int sx, int sy, D
     }
     BOOL ok = FALSE;
     if (copy_update_region(target, dst, fresh)) {
-        int previous = SetStretchBltMode(fresh, COLORONCOLOR);
-        if (previous) {
-            ok = StretchBlt(fresh, 0, 0, LOGICAL_WIDTH * g_factor, LOGICAL_HEIGHT * g_factor, src, sx, sy,
-                            LOGICAL_WIDTH, LOGICAL_HEIGHT, rop);
-            if (!ok) {
-                scale_error(target, "StretchBlt");
-            }
-            if (!SetStretchBltMode(fresh, previous)) {
-                scale_error(target, "restore stretch mode");
-            }
-        } else {
-            scale_error(target, "SetStretchBltMode");
+        ok = stretch_frame(fresh, src, sx, sy, g_factor, rop);
+        if (!ok) {
+            scale_error(target, "StretchBlt");
         }
     }
     if (!ReleaseDC(target->hwnd, fresh)) {
@@ -1497,17 +2002,40 @@ static BOOL draw_frame(scale_target *target, HDC dst, HDC src, int sx, int sy, D
     return ok;
 }
 
+/* Refresh through the same destination/source and GDI branch as the game. */
+static void refresh_game_frame(scale_target *target, HDC dst, HDC src, int sx, int sy, DWORD rop)
+{
+    if (!d3d11_out_begin_gdi_refresh()) {
+        return;
+    }
+
+    BOOL ok = FALSE;
+    __try {
+        if (!target || transformed_dc(dst)) {
+            ok = g_bitblt(dst, 0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT, src, sx, sy, rop);
+        } else {
+            ok = draw_frame(target, dst, src, sx, sy, rop);
+        }
+    } __finally {
+        d3d11_out_end_gdi_refresh(ok);
+    }
+}
+
 /* BitBlt ABI: nine stack arguments, stdcall pops 36 bytes, BOOL in EAX.
  * No game code is called except by the normal WndProc message dispatch. */
 static BOOL WINAPI frame_blit(HDC dst, int x, int y, int width, int height, HDC src, int sx, int sy,
                               DWORD rop)
 {
+    if (diag_enabled(DIAG_UI)) {
+        diag_blit(WindowFromDC(dst), src, x, y, width, height, sx, sy);
+    }
     if (!g_drawing &&
         (x || y || sx || sy || width != LOGICAL_WIDTH || height != LOGICAL_HEIGHT || rop != SRCCOPY)) {
         d3d11_out_hide();
     }
     if (!g_factor && !g_drawing && x == 0 && y == 0 && sx == 0 && sy == 0 && width == LOGICAL_WIDTH &&
         height == LOGICAL_HEIGHT && rop == SRCCOPY && d3d11_out_frame(WindowFromDC(dst), src, 1)) {
+        refresh_game_frame(NULL, dst, src, sx, sy, rop);
         return TRUE;
     }
     if (!g_factor) {
@@ -1525,6 +2053,7 @@ static BOOL WINAPI frame_blit(HDC dst, int x, int y, int width, int height, HDC 
                     /* D3D owns only a full qualifying Surface_Present frame. The
                      * existing GDI branches and child sweep remain the fallback. */
                     if (sx == 0 && sy == 0 && d3d11_out_frame(hwnd, src, g_factor)) {
+                        refresh_game_frame(target, dst, src, sx, sy, rop);
                         sweep_children(GetAncestor(hwnd, GA_ROOT));
                         return TRUE;
                     }
@@ -1605,6 +2134,8 @@ static int read_factor(const char *dir)
     strcat_s(path, sizeof(path), "tow_fix.ini");
     g_dialogs = GetPrivateProfileIntA("scaling", "dialogs", 1, path) != 0;
     g_fonts = GetPrivateProfileIntA("scaling", "fonts", 1, path) != 0;
+    g_soft_cursor_clip = GetPrivateProfileIntA("scaling", "soft_cursor_clip", 1, path) != 0;
+    log_line("scaling: soft_cursor_clip=%d", g_soft_cursor_clip);
     g_scale_cursor = GetPrivateProfileIntA("scaling", "cursor", 1, path) != 0;
     g_dc_transform = GetPrivateProfileIntA("scaling", "dc_transform", 1, path) != 0;
     g_dc_transform_controls = GetPrivateProfileIntA("scaling", "dc_transform_controls", 0, path) != 0;
@@ -1944,6 +2475,13 @@ static void install_window_diagnostics(void)
 void scaling_apply(const char *dir)
 {
     g_factor = read_factor(dir);
+    log_line("[scaling] factor_active=%d dialogs=%d fonts=%d cursor=%d dc_transform=%d "
+             "dc_transform_controls=%d log_windows=%d",
+             g_factor, g_dialogs, g_fonts, g_scale_cursor, g_dc_transform, g_dc_transform_controls,
+             g_log_windows);
+    if (diag_enabled(DIAG_YESNO)) {
+        install_yesno_diagnostics();
+    }
     if (g_factor) {
         if (install_scaling()) {
             g_installed = 1;
@@ -1974,10 +2512,19 @@ void scaling_apply(const char *dir)
             }
         }
     }
+    diag_yesno_imports(GetModuleHandleA(NULL), 0);
+    diag_yesno_imports(GetModuleHandleA("MFC42.DLL"), 1);
+    diag_ui_install();
 }
 
 static void forget_dialog(HWND hwnd)
 {
+    if (diag_enabled(DIAG_YESNO) && hwnd == g_yesno_dialog) {
+        g_yesno_dialog = NULL;
+        diag_yesno_window(NULL);
+        g_yesno_painted = 0;
+        memset(g_yesno_controls, 0, sizeof(g_yesno_controls));
+    }
     for (unsigned i = 0; i < ARRAYSIZE(g_centered); ++i) {
         if (g_centered[i] == hwnd) {
             g_centered[i] = NULL;
@@ -2042,7 +2589,7 @@ static void center_dialog(HWND hwnd)
     }
     g_centered[free_slot] = hwnd;
     g_scaling_child = 1;
-    BOOL ok = SetWindowPos(hwnd, NULL, x, y, w, h, flags);
+    BOOL ok = scaling_set_window_pos(hwnd, NULL, x, y, w, h, flags);
     g_scaling_child = 0;
     if (!ok) {
         forget_dialog(hwnd);
@@ -2060,6 +2607,9 @@ static void center_dialog(HWND hwnd)
     }
     if (enlarge) {
         sweep_children(hwnd);
+    }
+    if (diag_enabled(DIAG_YESNO)) {
+        yesno_layout(hwnd, "center_dialog", NULL);
     }
 }
 
@@ -2330,6 +2880,7 @@ static int WINAPI release_dc_3(HWND hwnd, HDC dc)
 
 static void install_paint_imports(HMODULE module, unsigned index)
 {
+    diag_yesno_imports(module, index);
     if (!g_dc_transform || !module || (index >= 2 && !g_dc_transform_controls)) {
         return;
     }
@@ -2347,11 +2898,25 @@ static void install_paint_imports(HMODULE module, unsigned index)
     log_line("scaling: %s paint imports checked", modules[index]);
 }
 
+static HMODULE pin_scaling_module(const wchar_t *name)
+{
+    HMODULE module;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, name, &module)) {
+        log_line("scaling: module pin failed module=%ls error=%lu", name, GetLastError());
+        return NULL;
+    }
+    return module;
+}
+
 static void install_ocx(void)
 {
     static HMODULE installed;
     HMODULE module = GetModuleHandleA("Anibtn32.ocx");
-    if (!g_dc_transform || !module || module == installed) {
+    if (!module || module == installed) {
+        return;
+    }
+    module = pin_scaling_module(L"Anibtn32.ocx");
+    if (!module) {
         return;
     }
     installed = module;
@@ -2377,6 +2942,10 @@ static void install_mfc40(void)
     if (!module) {
         return;
     }
+    module = pin_scaling_module(L"MFC40.DLL");
+    if (!module) {
+        return;
+    }
     attempted = 1;
     install_import(module, "user32.dll", "SetWindowPos", (void *)position_2, &g_position[2]);
     install_import(module, "user32.dll", "MoveWindow", (void *)move_2, &g_move[2]);
@@ -2388,6 +2957,9 @@ static void install_mfc40(void)
 /* BitBlt stdcall ABI: 9 arguments, callee pops 36 bytes. */
 static BOOL WINAPI copy_blit(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop)
 {
+    if (g_diag_yesno_enabled) {
+        diag_yesno_gdi("BitBlt", _ReturnAddress(), dst, x, y, w, h, w, h, rop);
+    }
     if (g_drawing) {
         return g_bitblt(dst, x, y, w, h, src, sx, sy, rop);
     }

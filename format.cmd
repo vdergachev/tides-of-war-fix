@@ -6,7 +6,7 @@ call "%~dp0vsenv.cmd"
 if errorlevel 1 goto fail
 set "LLVM=%VSROOT%\VC\Tools\Llvm\x64\bin"
 if not exist "%LLVM%\clang-format.exe" goto fail
-for /r src %%f in (*.c *.h) do (
+for /r src %%f in (*.c *.cpp *.h) do (
     "%LLVM%\clang-format.exe" -i "%%f"
     if errorlevel 1 goto fail
 )

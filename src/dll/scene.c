@@ -5,10 +5,12 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include "scene.h"
+#include "wake_geometry.h"
 #include "patch.h"
 #include "log.h"
+#include "diag.h"
 
-/* W60-W63, supported image only. All offsets are observation-only. */
+/* Scene capture for smoothing, supported image only. All offsets are observation-only. */
 #define CLOUD_CALL_ADDRESS     0x43ae82
 #define CLOUD_ADDRESS          0x43dbe0
 #define CLOUD_FLAGS_ADDRESS    0x4cde38
@@ -26,6 +28,9 @@
 #define SHIP_PASS_CALL_ADDRESS 0x43ae21
 #define SHIP_CALL_ADDRESS      0x455fb5
 #define SHIP_ADDRESS           0x456d30
+#define HULL_DRAW_ADDRESS      0x456c40
+#define HULL_DRAW_CALL1        0x455e97
+#define HULL_DRAW_CALL2        0x455f8e
 #define BLEND_CALL_ADDRESS     0x417f2b
 #define BLEND_ADDRESS          0x418020
 #define BLIT_CALL_ADDRESS      0x418960
@@ -57,11 +62,44 @@ static const BYTE BLIT_BYTES[] = {0xe8, 0xdb, 0xf1, 0xff, 0xff};
 static const BYTE STEP_BYTES[] = {0x64, 0xa1, 0, 0, 0, 0, 0x6a, 0xff};
 static DWORD g_pass_fn = PASS_ADDRESS;
 static DWORD g_ship_fn = SHIP_ADDRESS;
+static DWORD g_hull_fn = HULL_DRAW_ADDRESS;
+static WORD *g_diag_before;
+static unsigned g_diag_drawing_id;
+static unsigned g_diag_pass;
+static int g_diag_draw_valid;
+static unsigned g_diag_ui_hash;
+static int g_diag_ui_seen;
+static RECT g_diag_c_view;
+static int g_diag_masks_ready;
 static DWORD g_blend_fn = BLEND_ADDRESS;
 static DWORD g_blit_fn = BLIT_ADDRESS;
 static DWORD g_step_resume = STEP_RESUME_ADDRESS;
 static SRWLOCK *g_lock;
 static scene_record g_storage[SCENE_RING + 1];
+static diag_frame *g_diag_frames;
+static WORD (*g_diag_drawings)[2][SCENE_PIXELS];
+
+/* The exchanged worker record is the sole record outside g_storage. */
+static unsigned diagnostic_index(const scene_record *record)
+{
+    for (unsigned i = 0; i <= SCENE_RING; ++i) {
+        if (record == &g_storage[i]) {
+            return i;
+        }
+    }
+    return SCENE_RING + 1;
+}
+
+diag_frame *scene_diagnostic(const scene_record *record)
+{
+    return &g_diag_frames[diagnostic_index(record)];
+}
+
+WORD (*scene_drawing(const scene_record *record))[SCENE_PIXELS]
+{
+    return g_diag_drawings[diagnostic_index(record)];
+}
+
 static scene_record *g_work = &g_storage[SCENE_RING];
 static scene_record *g_queue[SCENE_RING];
 static unsigned g_head;
@@ -71,7 +109,9 @@ static unsigned g_last_step;
 static int g_had_record;
 static int g_open;
 static int g_mode;
+static int g_in_pass;
 static int g_current = -1;
+static unsigned g_current_id;
 static BYTE *g_frame;
 static double g_cost;
 static double g_cost_max;
@@ -127,6 +167,7 @@ static void __stdcall observe_enter(const DWORD *saved)
         const DWORD *args = saved + 11;
         int mode = (int)(args[1] & 255);
         g_mode = mode;
+        g_in_pass = 1;
         g_current = -1;
         if (!g_lock || !mission()) {
             g_open = 0;
@@ -134,13 +175,16 @@ static void __stdcall observe_enter(const DWORD *saved)
         }
         if (mode == 1) {
             g_step_cost = 0;
-            memset(g_work, 0, offsetof(scene_record, pixels));
+            memset(g_work, 0, offsetof(scene_record, draws));
             g_open = 1;
             g_frame = (BYTE *)args[0];
             g_work->step = g_step;
             g_work->cloud_flags = *(BYTE *)CLOUD_FLAGS_ADDRESS;
             g_work->qpc = start;
             g_work->view = *(RECT *)args[3];
+            if (diag_enabled(DIAG_MASKS)) {
+                memset(scene_drawing(g_work), 0xff, sizeof(*g_diag_drawings));
+            }
             BYTE *camera = *(BYTE **)CAMERA_ADDRESS;
             RECT world = *(RECT *)(camera + CAMERA_RECT);
             g_work->camera.x = world.left;
@@ -180,6 +224,7 @@ static void __stdcall observe_leave(const DWORD *saved)
     LONGLONG start = ticks();
     __try {
         g_current = -1;
+        g_in_pass = 0;
         if (g_open && !copy_layer(g_mode ? SCENE_A1 : SCENE_B)) {
             g_work->valid = 0;
         }
@@ -198,11 +243,12 @@ static void __stdcall observe_ship(const DWORD *saved)
     LONGLONG start = ticks();
     g_current = -1;
     __try {
-        if (!g_open || g_mode != 0 || !g_work->valid) {
+        if (!g_open || !g_work->valid) {
             __leave;
         }
         BYTE *slot = (BYTE *)saved[6];
         unsigned id = *(WORD *)(slot + SLOT_ID);
+        g_current_id = id;
         if (id == 0xffff) {
             __leave;
         }
@@ -214,13 +260,22 @@ static void __stdcall observe_ship(const DWORD *saved)
         BYTE *ship = (*(BYTE ***)(table + TABLE_ARRAY))[id];
         unsigned type = *(WORD *)(ship + SHIP_TYPE);
         if (type == 9 || type == 10) {
+            /* Static objects precede ships in the hull pass. Move with camera. */
+            g_current = SCENE_SHIPS;
             __leave;
         }
-        if (g_work->count == SCENE_SHIPS) {
+        unsigned index = 0;
+        while (index < g_work->count && g_work->ships[index].id != id) {
+            ++index;
+        }
+        if (index == SCENE_SHIPS) {
             g_work->valid = 0;
             __leave;
         }
-        scene_ship *out = &g_work->ships[g_work->count++];
+        if (index == g_work->count) {
+            ++g_work->count;
+        }
+        scene_ship *out = &g_work->ships[index];
         double *pose = *(double **)(ship + SHIP_POSE);
         out->ptr = (uintptr_t)ship;
         out->id = id;
@@ -229,7 +284,7 @@ static void __stdcall observe_ship(const DWORD *saved)
         out->course = pose[2];
         out->point = *(POINT *)(ship + SHIP_POINT);
         SetRectEmpty(&out->box);
-        g_current = (int)g_work->count - 1;
+        g_current = (int)index;
         if (!(fabs(out->x) < 1e8 && fabs(out->y) < 1e8 && fabs(out->course) < 1e8) ||
             abs(out->point.x) > 100000000 || abs(out->point.y) > 100000000) {
             g_work->valid = 0;
@@ -244,12 +299,53 @@ static void __stdcall observe_ship(const DWORD *saved)
 }
 
 /* The D3D colour-key transfer supplies the clipped destination rect. */
+static void diagnostic_transfer(const DWORD *saved)
+{
+    if (!diag_enabled(DIAG_MASKS) || !g_diag_draw_valid) {
+        return;
+    }
+    DWORD error = GetLastError();
+    __try {
+        const DWORD *args = saved + 11;
+        int width = (int)args[2];
+        int height = (int)args[3];
+        int dest_pitch = (int)args[4];
+        int source_pitch = (int)args[5];
+        if (width > 0 && width <= 144 && height > 0 && height <= 144 && dest_pitch >= -65536 &&
+            dest_pitch <= 65536 && source_pitch >= -65536 && source_pitch <= 65536 &&
+            abs(dest_pitch) >= width * 2 && abs(source_pitch) >= width * 2) {
+            unsigned equal = 0;
+            for (int y = 0; y < height; ++y) {
+                const WORD *dest = (const WORD *)((const BYTE *)args[0] + y * dest_pitch);
+                const WORD *source = (const WORD *)((const BYTE *)args[1] + y * source_pitch);
+                for (int x = 0; x < width; ++x) {
+                    if (source[x] != (WORD)args[6] && source[x] == dest[x]) {
+                        ++equal;
+                    }
+                }
+            }
+            if (equal && g_step % 32 == 0) {
+                diag_line(DIAG_MASKS, "source_nonkey_but_diff_equal step=%u pass=%u drawing_id=%u pixels=%u",
+                          g_step, g_diag_pass, g_diag_drawing_id, equal);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        diag_line(DIAG_MASKS, "source_nonkey_but_diff_equal unreadable=1");
+    }
+    SetLastError(error);
+}
+
 static void __stdcall observe_blit(const DWORD *saved)
 {
+    diagnostic_transfer(saved);
     DWORD error = GetLastError();
     LONGLONG start = ticks();
     __try {
-        if (!g_open || g_current < 0 || !g_work->valid) {
+        if (!g_open || !g_in_pass || !g_work->valid) {
+            __leave;
+        }
+        if (g_current < 0) {
+            g_work->valid = 0;
             __leave;
         }
         const DWORD *args = saved + 11;
@@ -261,7 +357,11 @@ static void __stdcall observe_blit(const DWORD *saved)
         int pitch = *(int *)(g_frame + DIB_PITCH);
         int w = (int)args[2];
         int h = (int)args[3];
-        if (!pitch || (int)args[4] != pitch || w < 1 || h < 1 || w > 144 || h > 144) {
+        int source_pitch = (int)args[5];
+        if (!bits || pitch < -65536 || pitch > 65536 || abs(pitch) < SCENE_WIDTH * 2 ||
+            (int)args[4] != pitch || w < 1 || h < 1 || w > SCENE_SPRITE_SIZE || h > SCENE_SPRITE_SIZE ||
+            source_pitch < -65536 || source_pitch > 65536 || abs(source_pitch) < w * 2 || !args[1] ||
+            g_work->draw_count == SCENE_DRAWS) {
             g_work->valid = 0;
             __leave;
         }
@@ -273,7 +373,26 @@ static void __stdcall observe_blit(const DWORD *saved)
             int x = remaining / 2;
             if (y >= 0 && y + h <= SCENE_HEIGHT && remaining >= 0 && !(remaining & 1) &&
                 remaining < abs(pitch) && x + w <= SCENE_WIDTH) {
-                SetRect(&g_work->ships[g_current].box, x, y, x + w, y + h);
+                scene_draw *draw = &g_work->draws[g_work->draw_count];
+                draw->ship = (unsigned)g_current;
+                draw->id = g_current_id;
+                draw->pass = g_mode == 1 ? 0 : 1;
+                draw->width = w;
+                draw->height = h;
+                draw->stride = source_pitch;
+                draw->key = (WORD)args[6];
+                SetRect(&draw->box, x, y, x + w, y + h);
+                for (int row = 0; row < h; ++row) {
+                    memcpy(draw->pixels + row * w, (const BYTE *)args[1] + row * source_pitch, w * 2);
+                }
+                if (g_current < SCENE_SHIPS) {
+                    scene_ship *ship = &g_work->ships[g_current];
+                    ship->box = draw->box;
+                    if (draw->pass == 0) {
+                        ship->wake_stern = wake_hull_stern(ship, draw, g_work->camera, g_work->view);
+                    }
+                }
+                ++g_work->draw_count;
                 found = 1;
                 break;
             }
@@ -294,6 +413,79 @@ static void __stdcall observe_step(const DWORD *saved)
 {
     (void)saved;
     ++g_step;
+}
+
+static void diagnostic_draw_enter(const DWORD *saved, unsigned pass)
+{
+    if (!diag_enabled(DIAG_MASKS)) {
+        return;
+    }
+    DWORD error = GetLastError();
+    g_diag_draw_valid = 0;
+    __try {
+        if (g_open && g_work->valid && g_frame) {
+            g_diag_drawing_id = *(WORD *)((BYTE *)saved[6] + SLOT_ID);
+            g_diag_pass = pass;
+            const BYTE *bits = *(BYTE **)(g_frame + DIB_BITS);
+            int pitch = *(int *)(g_frame + DIB_PITCH);
+            if (bits && pitch >= -65536 && pitch <= 65536 && abs(pitch) >= SCENE_WIDTH * 2) {
+                GdiFlush();
+                for (int y = 0; y < SCENE_HEIGHT; ++y) {
+                    memcpy(g_diag_before + y * SCENE_WIDTH, bits + y * pitch, SCENE_WIDTH * 2);
+                }
+                g_diag_draw_valid = 1;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        diag_line(DIAG_MASKS, "mask_draw phase=before unreadable=1");
+    }
+    SetLastError(error);
+}
+
+static void __stdcall diagnostic_hull_enter(const DWORD *saved)
+{
+    /* Hull fallback can also run inside the second Ships_DrawPass. Match the
+     * A0/A1 versus A/B mask interval, not just the component function name. */
+    observe_ship(saved);
+    diagnostic_draw_enter(saved, g_mode == 1 ? 0 : 1);
+}
+
+static void __stdcall diagnostic_ship_enter(const DWORD *saved)
+{
+    diagnostic_draw_enter(saved, 1);
+}
+
+static void __stdcall diagnostic_draw_leave(const DWORD *saved)
+{
+    (void)saved;
+    DWORD error = GetLastError();
+    __try {
+        if (g_diag_draw_valid) {
+            const BYTE *bits = *(BYTE **)(g_frame + DIB_BITS);
+            int pitch = *(int *)(g_frame + DIB_PITCH);
+            GdiFlush();
+            unsigned changed = 0;
+            for (int y = 0; y < SCENE_HEIGHT; ++y) {
+                const WORD *row = (const WORD *)(bits + y * pitch);
+                for (int x = 0; x < SCENE_WIDTH; ++x) {
+                    int p = y * SCENE_WIDTH + x;
+                    if (g_diag_before[p] != row[x]) {
+                        scene_drawing(g_work)[g_diag_pass][p] = (WORD)g_diag_drawing_id;
+                        ++changed;
+                    }
+                }
+            }
+            if (g_step % 128 == 0) {
+                diag_line(DIAG_MASKS, "mask_draw step=%u pass=%u drawing_id=%u changed=%u", g_step,
+                          g_diag_pass, g_diag_drawing_id, changed);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        diag_line(DIAG_MASKS, "mask_draw phase=after unreadable=1");
+    }
+    g_diag_draw_valid = 0;
+    g_current = -1;
+    SetLastError(error);
 }
 
 static void __stdcall observe_blend(const DWORD *saved)
@@ -402,6 +594,38 @@ OBSERVE_BRIDGE(ship_bridge, observe_ship)
 OBSERVE_BRIDGE(step_bridge, observe_step)
 OBSERVE_BRIDGE(blend_bridge, observe_blend)
 OBSERVE_BRIDGE(blit_bridge, observe_blit)
+OBSERVE_BRIDGE(diag_hull_bridge, diagnostic_hull_enter)
+OBSERVE_BRIDGE(diag_ship_bridge, diagnostic_ship_enter)
+OBSERVE_BRIDGE(diag_draw_leave_bridge, diagnostic_draw_leave)
+
+/* Same three-argument thiscall ABI as ship_thunk; one displaced original call.
+ * After observer preserves the callee's result flags, registers and FP state. */
+__declspec(naked) static void diagnostic_hull_thunk(void)
+{
+    __asm {
+        call diag_hull_bridge
+        push dword ptr [esp + 12]
+        push dword ptr [esp + 12]
+        push dword ptr [esp + 12]
+        call dword ptr [g_hull_fn]
+        call diag_draw_leave_bridge
+        ret 12
+    }
+}
+
+__declspec(naked) static void diagnostic_ship_thunk(void)
+{
+    __asm {
+        call ship_bridge
+        call diag_ship_bridge
+        push dword ptr [esp + 12]
+        push dword ptr [esp + 12]
+        push dword ptr [esp + 12]
+        call dword ptr [g_ship_fn]
+        call diag_draw_leave_bridge
+        ret 12
+    }
+}
 
 /* Pass entry: [ESP]=return, +4..+16=four args, ECX=ships.
  * The original call consumes four copied args; RET 16 consumes originals.
@@ -435,15 +659,7 @@ __declspec(naked) static void cloud_thunk(void)
     }
 }
 
-/* Tail thunks keep original return/arguments/ECX intact; original callee returns. */
-__declspec(naked) static void ship_thunk(void)
-{
-    __asm {
-        call ship_bridge
-        jmp dword ptr [g_ship_fn]
-    }
-}
-
+/* Tail thunks preserve original return/arguments/ECX; original callee returns. */
 __declspec(naked) static void blend_thunk(void)
 {
     __asm {
@@ -474,6 +690,27 @@ __declspec(naked) static void step_thunk(void)
 
 // clang-format on
 
+static int install_diagnostic_hulls(void)
+{
+    const DWORD sites[] = {HULL_DRAW_CALL1, HULL_DRAW_CALL2};
+    BYTE expected[2][5];
+    for (unsigned i = 0; i < 2; ++i) {
+        expected[i][0] = 0xe8;
+        DWORD relative = HULL_DRAW_ADDRESS - sites[i] - 5;
+        memcpy(expected[i] + 1, &relative, 4);
+        if (!patch_check((void *)(uintptr_t)sites[i], expected[i], 5)) {
+            log_line("diag: hull observer rejected caller=%08lx", sites[i]);
+            return 0;
+        }
+    }
+    for (unsigned i = 0; i < 2; ++i) {
+        if (!patch_call((void *)(uintptr_t)sites[i], expected[i], (void *)(uintptr_t)diagnostic_hull_thunk)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int scene_init(SRWLOCK *lock)
 {
     if (!patch_check((void *)CLOUD_CALL_ADDRESS, CLOUD_BYTES, sizeof(CLOUD_BYTES)) ||
@@ -489,15 +726,37 @@ int scene_init(SRWLOCK *lock)
     LARGE_INTEGER frequency;
     QueryPerformanceFrequency(&frequency);
     g_frequency = frequency.QuadPart;
+    if (diag_enabled(DIAG_UI) || diag_enabled(DIAG_TRANSITIONS)) {
+        g_diag_frames = calloc(SCENE_RING + 2, sizeof(*g_diag_frames));
+        if (!g_diag_frames) {
+            return 0;
+        }
+    }
+    if (diag_enabled(DIAG_MASKS)) {
+        g_diag_before = calloc(SCENE_PIXELS, sizeof(*g_diag_before));
+        g_diag_drawings = calloc(SCENE_RING + 2, sizeof(*g_diag_drawings));
+        if (!g_diag_drawings || !g_diag_before) {
+            free(g_diag_before);
+            free(g_diag_drawings);
+            free(g_diag_frames);
+            g_diag_frames = NULL;
+            return 0;
+        }
+    }
     g_last_log = GetTickCount();
     for (unsigned i = 0; i < SCENE_RING; ++i) {
         g_queue[i] = &g_storage[i];
     }
     /* Hooks remain inert until the complete set is installed. */
+    g_diag_masks_ready = install_diagnostic_hulls();
+    if (!g_diag_masks_ready) {
+        log_line("scene: hull capture hooks unavailable; plain frames only");
+        return 0;
+    }
     if (!patch_call((void *)CLOUD_CALL_ADDRESS, CLOUD_BYTES, (void *)(uintptr_t)cloud_thunk) ||
         !patch_call((void *)HULL_CALL_ADDRESS, HULL_BYTES, (void *)(uintptr_t)pass_thunk) ||
         !patch_call((void *)SHIP_PASS_CALL_ADDRESS, PASS_BYTES, (void *)(uintptr_t)pass_thunk) ||
-        !patch_call((void *)SHIP_CALL_ADDRESS, SHIP_BYTES, (void *)(uintptr_t)ship_thunk) ||
+        !patch_call((void *)SHIP_CALL_ADDRESS, SHIP_BYTES, (void *)(uintptr_t)diagnostic_ship_thunk) ||
         !patch_call((void *)BLEND_CALL_ADDRESS, BLEND_BYTES, (void *)(uintptr_t)blend_thunk) ||
         !patch_call((void *)BLIT_CALL_ADDRESS, BLIT_BYTES, (void *)(uintptr_t)blit_thunk) ||
         !patch_jmp_padded((void *)STEP_ADDRESS, STEP_BYTES, sizeof(STEP_BYTES),
@@ -510,18 +769,57 @@ int scene_init(SRWLOCK *lock)
     return 1;
 }
 
-void scene_present(HDC source, LONG epoch)
+static void diagnostic_ui_present(LONG serial)
+{
+    DWORD error = GetLastError();
+    __try {
+        if (g_frame) {
+            RECT panel = {0, 128, 128, 480};
+            unsigned hash =
+                diag_hash565(*(const WORD **)(g_frame + DIB_BITS), *(int *)(g_frame + DIB_PITCH), panel);
+            if (!g_open && mission() && g_had_record && g_step == g_last_step && g_diag_ui_seen &&
+                hash != g_diag_ui_hash) {
+                diag_line(DIAG_UI,
+                          "ui_changed_same_step serial=%ld step=%u C_step=%u hash=%08x previous=%08x "
+                          "view=(%ld,%ld,%ld,%ld)",
+                          serial, g_step, g_last_step, hash, g_diag_ui_hash, g_diag_c_view.left,
+                          g_diag_c_view.top, g_diag_c_view.right, g_diag_c_view.bottom);
+            }
+            g_diag_ui_hash = hash;
+            g_diag_ui_seen = 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        diag_line(DIAG_UI, "ui_changed_same_step unreadable=1");
+    }
+    SetLastError(error);
+}
+
+void scene_present(HDC source, LONG epoch, LONG serial)
 {
     if (!g_lock) {
         return;
     }
     LONGLONG start = ticks();
+    if (diag_enabled(DIAG_UI)) {
+        diagnostic_ui_present(serial);
+    }
     __try {
         if (!g_open && mission() && g_had_record && g_step == g_last_step) {
             return;
         }
         if (!mission() || !g_open || *(HDC *)(g_frame + DIB_HDC) != source || !copy_layer(SCENE_C)) {
             g_work->valid = 0;
+        }
+        if (diag_enabled(DIAG_TRANSITIONS) || diag_enabled(DIAG_UI)) {
+            scene_diagnostic(g_work)->epoch = epoch;
+            scene_diagnostic(g_work)->serial = serial;
+            scene_diagnostic(g_work)->state = *(int *)DRAW_STATE_ADDRESS;
+            scene_diagnostic(g_work)->dib = g_frame;
+            RECT menu = {160, 32, 480, 112};
+            scene_diagnostic(g_work)->menu_hash =
+                diag_hash565(g_work->pixels[SCENE_C], SCENE_WIDTH * 2, menu);
+            scene_diagnostic(g_work)->ui_hash = g_diag_ui_hash;
+            g_diag_c_view = g_work->view;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         g_work->valid = 0;
@@ -602,7 +900,7 @@ void scene_capture_log(void)
     static unsigned last_coalesced;
     DWORD now = GetTickCount();
     double seconds = (DWORD)(now - g_last_log) / 1000.0;
-    log_line("scene: records_interval=%u records_s=%.2f invalid_interval=%u overruns_interval=%u "
+    diag_log("scene: records_interval=%u records_s=%.2f invalid_interval=%u overruns_interval=%u "
              "coalesced_interval=%u",
              records - last_records, seconds ? (records - last_records) / seconds : 0,
              failures - last_failures, overruns - last_overruns, coalesced - last_coalesced);
@@ -611,6 +909,6 @@ void scene_capture_log(void)
     last_overruns = overruns;
     last_coalesced = coalesced;
     g_last_log = now;
-    log_line("scene: records=%u invalid=%u overruns=%u capture_ms_mean=%.3f capture_ms_max=%.3f", records,
+    diag_log("scene: records=%u invalid=%u overruns=%u capture_ms_mean=%.3f capture_ms_max=%.3f", records,
              failures, overruns, mean, maximum);
 }

@@ -35,10 +35,16 @@ Target: Windows 7 SP1+ (`_WIN32_WINNT=0x0601`, `/SUBSYSTEM:…,6.01`), static CR
 | `src/dll/saves.c`, `registry.c` | saves in `saves\`, MFC profile in `saves\settings.ini`, no registry writes |
 | `src/dll/startup_warning.c`, `game_speed.c`, `draw_sync.c` | Windows 95 warning, game pace, draw after each step |
 | `src/dll/idle_wait.c` | wait for messages instead of busy-polling an empty queue |
+| `src/dll/timer_guard.c` | one live draw timer; restart of a lost game step (single player) |
+| `src/dll/diag.c` | optional observation-only diagnostics (`[diag]`) |
 | `src/dll/d3d_fix.c` | Direct3D RGB device and white LVERTEX diffuse (textured ships) |
-| `src/dll/d3d11_out.c`, `d3d11_out.h`, `d3d11_out.hlsl`, `d3d11_vs.h`, `d3d11_ps.h` | Direct3D 11 child-window output, vsync, shaders, and GDI fallback |
-| `src/dll/scene.c`, `scene.h`, `scene_gpu.c`, `scene_gpu.h`, `scene_vs.h`, `scene_vs.hlsl`, `scene_base_ps.h`, `scene_base_ps.hlsl` | mission-scene capture and interpolation between game steps |
-| `src/dll/cloud_art.c`, `cloud_art.h` | cloud sprites from the game's own art |
+| `src/dll/d3d11_out.cpp` | C interface of the C++ renderer |
+| `src/dll/renderer.cpp`, `output_window.cpp`, `frame_queue.cpp` (+ `.h`), `texture2d.h`, `render_raii.h` | Direct3D 11 device and swap chain, click-through child window, render thread, game-to-render frame hand-off, GDI fallback |
+| `src/dll/d3d11_out.hlsl`, `d3d11_vs.h`, `d3d11_ps.h` | output shaders |
+| `src/dll/scene.c`, `scene.h` | mission-scene capture (C hooks), per-ship sprites |
+| `src/dll/scene_gpu.cpp`, `scene_gpu.h`, `scene_vs.*`, `scene_base_ps.*`, `scene_wake_ps.h` | scene composition and interpolation between game steps |
+| `src/dll/wake_field.cpp`, `wake_layer.cpp`, `wake_geometry.h`, `wake_config.c` (+ `.h`) | ship wake: ripple field, bubbles, stern point, settings |
+| `src/dll/cloud_art.cpp`, `cloud_art.h`, `cloud_art_gpu.h` | cloud sprites from the game's own art |
 | `src/dll/scaling.c`, `display.c` | integer scaling, mouse/dialog/font/cursor mapping, borderless fullscreen |
 | `src/patcher/tow_patch.c` | patcher (console and double-click dialog modes) |
 
@@ -48,4 +54,6 @@ The DLL links `d3d11.lib` and `dxgi.lib` in addition to the existing Windows lib
 
 One statement per line, logical blocks separated by blank lines, short functions, game addresses and expected
 bytes as named constants with a comment, `// clang-format off/on` around `__asm` functions with a comment on the
-stack state. Run `format.cmd`, `lint.cmd` and `build.cmd` before a commit.
+stack state. Render code is C++17 without exceptions and RTTI (`/EHs-c- /GR-`), COM objects through `ComPtr`, no
+objects with destructors at static scope; hooks and patches stay in C. Run `format.cmd`, `lint.cmd` and `build.cmd`
+before a commit.

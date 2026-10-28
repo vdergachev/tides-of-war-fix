@@ -63,6 +63,8 @@ For reference, the main keys (`1` = on, `0` = off):
 | `[idle_wait]` | `enabled` | `1` | sleep instead of busy-polling (CPU load) |
 | `[save_redirect]`, `[registry_guard]` | `enabled` | `1` | saves and settings in `saves\`, no registry writes |
 | `[d3d11]` | `enabled`, `smooth` | `1` | set either to `0` to switch off the D3D11 path if you see problems |
+| `[wake]` | `enabled` | `1` | wake behind every ship |
+| `[timer_guard]` | `enabled` | `1` | no frozen world after fast clicks on ships |
 
 A log is written to `tow_fix.log` next to `TOW.exe`; please attach it to bug reports.
 

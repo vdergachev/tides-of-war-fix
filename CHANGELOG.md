@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.16.0
+
+- Wake behind every ship: the game's own ripple algorithm plus bubbles, drawn in the smooth scene on the sea under
+  hulls and clouds, kept off the land (`[wake]`, `enabled=0` turns it off).
+- No more frozen world after fast clicks on ships: the game created a new draw timer on every selection without
+  stopping the old one, ran out of system timers and lost its step timer. Only one draw timer is kept now, and a lost
+  step is restarted in single-player games (`[timer_guard]`).
+- The screen keeps updating if the game stops stepping for a moment.
+- Ships near other ships no longer carry a shifted piece of a neighbour's sails: each ship's image is captured
+  separately.
+- No cursor jump when grabbing the sail or crew controls (`[scaling] soft_cursor_clip`); restoring a saved cursor
+  clip no longer enlarges it twice.
+- No main-menu flash behind the panels on fast clicks (`[d3d11] gdi_refresh_ms`).
+- Optional diagnostics for bug reports (`[diag]`, all off by default).
+- The render code is now C++17 (no exceptions, no RTTI) split into classes.
+
 ## 0.15.0
 
 - Direct3D 11 output in a child window with vsync, with GDI fallback.

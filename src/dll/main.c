@@ -1,8 +1,10 @@
+#include "wake_config.h"
 #include <windows.h>
 #include <stdint.h>
 #include <string.h>
 #include "patch.h"
 #include "log.h"
+#include "diag.h"
 #include "game_folder.h"
 #include "saves.h"
 #include "registry.h"
@@ -10,13 +12,14 @@
 #include "game_speed.h"
 #include "draw_sync.h"
 #include "idle_wait.h"
+#include "timer_guard.h"
 #include "d3d_fix.h"
 #include "scale.h"
 #include "display.h"
 #include "d3d11_out.h"
 #include "../common/sha256.h"
 
-#define TOW_FIX_VERSION "0.15.0"
+#define TOW_FIX_VERSION "0.16.0"
 
 /* Supported game image and CRT entry point, before any game initialization. */
 #define GAME_IMAGE_BASE    0x400000
@@ -107,6 +110,7 @@ typedef struct {
     int draw_sync;
     int idle_wait;
     int max_wait_ms;
+    int timer_guard;
     int rgb_device;
     int white_diffuse;
     DWORD untextured_color;
@@ -123,6 +127,7 @@ static int read_settings(const char *dir, tow_settings *settings)
     }
     strcpy_s(path, sizeof(path), dir);
     strcat_s(path, sizeof(path), "tow_fix.ini");
+    wake_configure(path);
     if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
         log_line("tow_fix.ini missing; all fixes off");
     }
@@ -147,6 +152,12 @@ static int read_settings(const char *dir, tow_settings *settings)
         settings->max_wait_ms = 100;
     }
     log_line("[idle_wait] max_wait_ms=%d", settings->max_wait_ms);
+
+    /* Bug fix, not a preference: missing key (older ini) = on; missing ini keeps all fixes off. */
+    int timer_default = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+    settings->timer_guard = (int)GetPrivateProfileIntA("timer_guard", "enabled", timer_default, path);
+    log_line("[timer_guard] enabled=%d", settings->timer_guard);
+
     settings->rgb_device = (int)GetPrivateProfileIntA("rgb_device", "enabled", 0, path);
     log_line("[rgb_device] enabled=%d", settings->rgb_device);
     settings->white_diffuse = (int)GetPrivateProfileIntA("white_diffuse", "enabled", 0, path);
@@ -160,6 +171,7 @@ static int read_settings(const char *dir, tow_settings *settings)
     char fullscreen[32];
     GetPrivateProfileStringA("scaling", "fullscreen", "borderless", fullscreen, sizeof(fullscreen), path);
     settings->borderless_fullscreen = _stricmp(fullscreen, "off") != 0;
+    log_line("[scaling] fullscreen=%s", settings->borderless_fullscreen ? "borderless" : "off");
     if (_stricmp(fullscreen, "borderless") != 0 && _stricmp(fullscreen, "off") != 0) {
         log_line("display: invalid fullscreen setting (using borderless)");
     }
@@ -214,11 +226,17 @@ static void __cdecl tow_init(void)
     if (settings.idle_wait) {
         idle_wait_apply((unsigned)settings.max_wait_ms);
     }
+    /* Before diag_configure: [diag] timers wraps this hook, keeping one IAT chain. */
+    log_line("timer_guard: %s", settings.timer_guard ? "enabled" : "disabled");
+    if (settings.timer_guard) {
+        timer_guard_apply();
+    }
     log_line("rgb_device: %s", settings.rgb_device ? "enabled" : "disabled");
     log_line("white_diffuse: %s", settings.white_diffuse ? "enabled" : "disabled");
     if (settings.rgb_device || settings.white_diffuse) {
         d3d_fix_apply(settings.rgb_device, settings.white_diffuse, settings.untextured_color);
     }
+    diag_configure(dir);
     d3d11_out_configure(dir);
     scaling_apply(dir);
     display_apply(settings.borderless_fullscreen, settings.restore_on_exit);

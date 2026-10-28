@@ -12,6 +12,12 @@ static const uint8_t TIMER_STORES_BYTES[] = {0x89, 0x8e, 0xf4, 0x00, 0x00, 0x00,
 static const uint8_t TIMER_EPILOGUE_BYTES[] = {0x8b, 0xc6, 0x5e, 0xc2, 0x04, 0x00};
 
 static int g_step_delay;
+static unsigned g_applied_delay = 78;
+
+unsigned game_speed_step_delay(void)
+{
+    return g_applied_delay;
+}
 
 /* Entry: ESI=object, [ESP]=saved ESI, [ESP+4]=return, [ESP+8]=argument.
  * Exit: EAX=object, ESI restored, return and argument popped as in the constructor. */
@@ -36,6 +42,7 @@ int game_speed_apply(int percent)
         return 0;
     }
     if (percent == 100) {
+        g_applied_delay = 62;
         log_line("game_speed: original pace");
         return 1;
     }
@@ -55,6 +62,7 @@ int game_speed_apply(int percent)
     }
 
     log_line("game_speed: percent %d, step delay %d ms (original 62)", percent, g_step_delay);
+    g_applied_delay = (unsigned)g_step_delay;
     log_line("game_speed: ok");
     return 1;
 }
