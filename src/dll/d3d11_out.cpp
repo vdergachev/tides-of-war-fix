@@ -13,6 +13,11 @@ void d3d11_out_hide(void)
     output.hide();
 }
 
+void d3d11_out_hide_for_blit(HDC destination)
+{
+    output.hide_for_blit(destination);
+}
+
 int d3d11_out_begin_gdi_refresh(void)
 {
     return output.begin_gdi_refresh(0);

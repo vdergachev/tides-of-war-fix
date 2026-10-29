@@ -17,6 +17,7 @@
 #include <wrl/client.h>
 #include <utility>
 #include <new>
+#include "ship_transfer_ps.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -50,6 +51,7 @@ void SceneCompositor::release_entry(SceneEntry *entry)
         entry->regions[i].texture.Reset();
     }
     for (unsigned i = 0; i < SCENE_DRAWS; ++i) {
+        entry->hd_draws[i] = {};
         entry->draws[i].view.Reset();
         entry->draws[i].texture.Reset();
     }
@@ -108,6 +110,11 @@ void SceneCompositor::release(void)
         return;
     }
     reset_timeline();
+    hd_.reset();
+    hd_last_uploads_ = 0;
+    hd_transfer_.Reset();
+    hd_constants_.Reset();
+    hd_add_.Reset();
     art_.release();
     wake_.reset();
     resources_.raster.Reset();
@@ -242,7 +249,15 @@ int SceneCompositor::assign_masks(const scene_record *record)
                         }
                         owner_[pass][p] = (signed char)draw->ship;
                     }
-                    replay_[p] = value;
+                    if (draw->additive) {
+                        unsigned old = replay_[p];
+                        unsigned r = min(31u, (old >> 11) + (value >> 11));
+                        unsigned g = min(63u, ((old >> 5) & 63) + ((value >> 5) & 63));
+                        unsigned b = min(31u, (old & 31) + (value & 31));
+                        replay_[p] = (WORD)((r << 11) | (g << 5) | b);
+                    } else {
+                        replay_[p] = value;
+                    }
                     ++mask_pixels_[pass ? 2 : 0];
                 }
             }
@@ -382,10 +397,172 @@ int SceneCompositor::build_draw(ID3D11Device *device, SceneEntry *entry, const s
     const scene_draw *draw = &record->draws[index];
     entry->draw_ship[index] = draw->ship;
     entry->draw_pass[index] = draw->pass;
+    entry->draw_additive[index] = draw->additive;
     for (int p = 0; p < draw->width * draw->height; ++p) {
         pixels_[p] = draw->pixels[p] == draw->key ? 0 : color(draw->pixels[p]);
     }
     return upload_pixels(device, &entry->draws[index], draw->box);
+}
+
+void SceneCompositor::initialize_hd(ID3D11Device *device, ID3D11DeviceContext *context)
+{
+    if (!hd_add_) {
+        D3D11_BLEND_DESC blend = {};
+        auto &rt = blend.RenderTarget[0];
+        rt.BlendEnable = TRUE;
+        rt.SrcBlend = D3D11_BLEND_ONE;
+        rt.DestBlend = D3D11_BLEND_ONE;
+        rt.BlendOp = D3D11_BLEND_OP_ADD;
+        rt.SrcBlendAlpha = D3D11_BLEND_ONE;
+        rt.DestBlendAlpha = D3D11_BLEND_ZERO;
+        rt.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(device->CreateBlendState(&blend, hd_add_.ReleaseAndGetAddressOf()))) {
+            return;
+        }
+    }
+    if (!hd_) {
+        hd_.reset(new (std::nothrow) ShipGpu);
+        if (!hd_ || !hd_->initialize(device, context)) {
+            hd_.reset();
+        }
+    }
+    if (hd_ && !hd_transfer_) {
+        HRESULT hr = device->CreatePixelShader(tow_ship_transfer_ps, sizeof(tow_ship_transfer_ps), nullptr,
+                                               hd_transfer_.ReleaseAndGetAddressOf());
+        D3D11_BUFFER_DESC desc = {};
+        desc.ByteWidth = 16;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (SUCCEEDED(hr)) {
+            hr = device->CreateBuffer(&desc, nullptr, hd_constants_.ReleaseAndGetAddressOf());
+        }
+        if (FAILED(hr)) {
+            hd_transfer_.Reset();
+        }
+    }
+}
+
+bool SceneCompositor::build_hd_draw(ID3D11DeviceContext *, SceneEntry *entry, const scene_record *record,
+                                    unsigned index, unsigned side, unsigned &triangles)
+{
+    const hd_live_record *live = record->hd;
+    bool ok = false;
+    if (hd_ && hd_transfer_ && hd_add_ && live) {
+        const scene_draw &sprite = record->draws[index];
+        for (unsigned p = 0; p < live->passes; ++p) {
+            const hd_pass &pass = live->pass[p];
+            if (pass.id != sprite.id || pass.pass != 1 - sprite.pass ||
+                memcmp(pass.dest, &sprite.box, sizeof(RECT)) || !pass.reference_valid || pass.source[0] < 0 ||
+                pass.source[1] < 0 || pass.source[2] > HD_SIZE || pass.source[3] > HD_SIZE) {
+                continue;
+            }
+            HdGpuView view = {live->pass,    live->passes,      live->draw,     live->draws,
+                              live->texture, live->textures,    live->geometry, live->geometry_bytes,
+                              live->pixels,  live->pixel_bytes, live->offsets};
+            Texture2D target;
+            if (hd_->render(view, p, side, target)) {
+                target.box.left = pass.dest[0] - pass.source[0];
+                target.box.top = pass.dest[1] - pass.source[1];
+                target.box.right = target.box.left + HD_SIZE;
+                target.box.bottom = target.box.top + HD_SIZE;
+                entry->hd_draws[index] = std::move(target);
+                entry->hd_passes[index] = pass;
+                for (unsigned d = pass.first_draw; d < pass.first_draw + pass.draw_count; ++d) {
+                    const hd_draw &draw = live->draw[d];
+                    if (draw.result >= 0) {
+                        triangles += (draw.index_count ? draw.index_count : draw.vertex_count) / 3;
+                    }
+                }
+                ok = true;
+            }
+            break;
+        }
+    }
+    return ok;
+}
+
+/* Full pass targets preserve painter order and make ghost add happen once per
+ * transfer, after all of its triangles. Original sprites remain the fallback. */
+void SceneCompositor::build_hd(ID3D11Device *device, ID3D11DeviceContext *context, SceneEntry *entry,
+                               const scene_record *record, UINT width, UINT height)
+{
+    if (!ship_hd_render_scale()) {
+        return;
+    }
+    double start = ticks();
+    initialize_hd(device, context);
+    if (hd_) {
+        hd_->begin_record();
+    }
+    const hd_live_record *live = record->hd;
+    unsigned factor = min(16u, max(1u, max(width / SCENE_WIDTH, height / SCENE_HEIGHT)));
+    unsigned scale = min((unsigned)ship_hd_render_scale(), factor);
+    if (hd_render_scale_ != scale) {
+        diag_log("hd_ships: render_scale=%u factor=%u", scale, factor);
+        hd_render_scale_ = scale;
+    }
+    unsigned side = HD_SIZE * scale;
+    bool failed[SCENE_SHIPS + 1] = {};
+    bool seen[SCENE_SHIPS + 1] = {};
+    unsigned triangles[SCENE_SHIPS + 1] = {};
+    for (unsigned i = 0; i < entry->draw_count; ++i) {
+        unsigned ship = entry->draw_ship[i];
+        seen[ship] = true;
+        entry->hd_draws[i] = {};
+        bool ok = build_hd_draw(context, entry, record, i, side, triangles[ship]);
+        failed[ship] = failed[ship] || !ok;
+    }
+    for (unsigned i = 0; i < entry->draw_count; ++i) {
+        if (failed[entry->draw_ship[i]]) {
+            entry->hd_draws[i] = {};
+        }
+    }
+    for (unsigned i = 0; i <= SCENE_SHIPS; ++i) {
+        if (seen[i]) {
+            ships_hd_ += !failed[i];
+            ships_fallback_ += failed[i];
+            triangles_hd_ += failed[i] ? 0 : triangles[i];
+        }
+    }
+    hd_ms_ += (ticks() - start) * 1000 / frequency_ + (live ? live->capture_ms : 0);
+}
+
+bool SceneCompositor::draw_hd(ID3D11DeviceContext *context, const SceneEntry *entry, unsigned index,
+                              double dx, double dy, UINT width, UINT height)
+{
+    const Texture2D &target = entry->hd_draws[index];
+    if (!target.view) {
+        return false;
+    }
+    const hd_pass &pass = entry->hd_passes[index];
+    context->PSSetShader(hd_transfer_.Get(), nullptr, 0);
+    context->PSSetConstantBuffers(0, 1, hd_constants_.GetAddressOf());
+    unsigned constants[4] = {pass.key, 0, 0, 0};
+    context->UpdateSubresource(hd_constants_.Get(), 0, nullptr, constants, 0, 0);
+    context->OMSetBlendState(pass.blend ? hd_add_.Get() : resources_.blend.Get(), nullptr, UINT32_MAX);
+    FLOAT placement[4] = {static_cast<FLOAT>((target.box.left + dx) / SCENE_WIDTH),
+                          static_cast<FLOAT>((target.box.top + dy) / SCENE_HEIGHT),
+                          static_cast<FLOAT>(HD_SIZE) / SCENE_WIDTH,
+                          static_cast<FLOAT>(HD_SIZE) / SCENE_HEIGHT};
+    RECT clip = {
+        static_cast<LONG>(floor(max((double)entry->view.left, pass.dest[0] + dx) * width / SCENE_WIDTH + .5)),
+        static_cast<LONG>(
+            floor(max((double)entry->view.top, pass.dest[1] + dy) * height / SCENE_HEIGHT + .5)),
+        static_cast<LONG>(
+            floor(min((double)entry->view.right, pass.dest[2] + dx) * width / SCENE_WIDTH + .5)),
+        static_cast<LONG>(
+            floor(min((double)entry->view.bottom, pass.dest[3] + dy) * height / SCENE_HEIGHT + .5))};
+    if (clip.right > clip.left && clip.bottom > clip.top) {
+        context->RSSetScissorRects(1, &clip);
+        context->UpdateSubresource(resources_.placement.Get(), 0, nullptr, placement, 0, 0);
+        context->PSSetShaderResources(0, 1, target.view.GetAddressOf());
+        context->Draw(4, 0);
+        ++draws_;
+    }
+    context->PSSetShader(resources_.layer_ps.Get(), nullptr, 0);
+    context->OMSetBlendState(resources_.blend.Get(), nullptr, UINT32_MAX);
+    return true;
 }
 
 int SceneCompositor::upload_pixels(ID3D11Device *device, Texture2D *out, RECT bounds)
@@ -429,9 +606,9 @@ void SceneCompositor::discard_first(void)
     resources_.entries[count_].wake_bottom = std::move(bottom);
 }
 
-void SceneCompositor::update(ID3D11Device *device, ID3D11DeviceContext *context, LONG epoch)
+void SceneCompositor::update(ID3D11Device *device, ID3D11DeviceContext *context, LONG epoch, UINT width,
+                             UINT height)
 {
-    (void)context;
     if (!initialized_) {
         return;
     }
@@ -506,6 +683,9 @@ void SceneCompositor::update(ID3D11Device *device, ID3D11DeviceContext *context,
         }
         for (unsigned i = 0; i < out->draw_count && ok; ++i) {
             ok = build_draw(device, out, queue_.input_, i);
+        }
+        if (ok) {
+            build_hd(device, context, out, queue_.input_, width, height);
         }
         if (!ok) {
             release_entry(out);
@@ -783,6 +963,14 @@ int SceneCompositor::draw(ID3D11DeviceContext *context, UINT width, UINT height,
         }
     }
     const SceneEntry *entry = &resources_.entries[current];
+    if (!hd_add_) {
+        for (unsigned i = 0; i < entry->draw_count; ++i) {
+            if (entry->draw_additive[i]) {
+                /* Only this frame needs the preserved plain output; retry on upload. */
+                return 0;
+            }
+        }
+    }
     if (diag_enabled(DIAG_UI) || diag_enabled(DIAG_TRANSITIONS)) {
         diagnostics_[SCENE_RING].frame = diagnostics_[entry - resources_.entries].frame;
     }
@@ -878,7 +1066,13 @@ int SceneCompositor::draw(ID3D11DeviceContext *context, UINT width, UINT height,
                 unsigned ship = entry->draw_ship[i];
                 double dx = ship == SCENE_SHIPS ? shift[0] : offsets[ship][0];
                 double dy = ship == SCENE_SHIPS ? shift[1] : offsets[ship][1];
-                draw_sprite(context, &entry->draws[i], dx, dy, entry->view, width, height);
+                if (!draw_hd(context, entry, i, dx, dy, width, height)) {
+                    if (entry->draw_additive[i] && hd_add_) {
+                        context->OMSetBlendState(hd_add_.Get(), nullptr, UINT32_MAX);
+                    }
+                    draw_sprite(context, &entry->draws[i], dx, dy, entry->view, width, height);
+                    context->OMSetBlendState(resources_.blend.Get(), nullptr, UINT32_MAX);
+                }
             }
         }
     }
@@ -909,6 +1103,16 @@ void SceneCompositor::counters(unsigned *draws, unsigned *uploads, unsigned long
 
 void SceneCompositor::log(void)
 {
+    if (ship_hd_render_scale()) {
+        unsigned textures = hd_ ? hd_->uploads() : 0;
+        diag_log("hd_ships: ships_hd=%u ships_fallback=%u triangles=%u textures=%u ms=%.3f", ships_hd_,
+                 ships_fallback_, triangles_hd_, textures - hd_last_uploads_, hd_ms_);
+        hd_last_uploads_ = textures;
+        ships_hd_ = 0;
+        ships_fallback_ = 0;
+        triangles_hd_ = 0;
+        hd_ms_ = 0;
+    }
     if (wake_) {
         wake_->log();
     }

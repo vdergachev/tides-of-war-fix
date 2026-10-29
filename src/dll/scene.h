@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <stdint.h>
 #include "diag.h"
+#include "ship_live.h"
 
 #define SCENE_WIDTH  640
 #define SCENE_HEIGHT 480
@@ -53,6 +54,7 @@ typedef struct {
     int height;
     int stride;
     WORD key;
+    unsigned additive;
     RECT box;
     WORD pixels[SCENE_SPRITE_PIXELS];
 } scene_draw;
@@ -72,6 +74,7 @@ typedef struct {
     scene_cloud clouds[SCENE_CLOUDS];
     unsigned draw_count;
     scene_draw draws[SCENE_DRAWS];
+    hd_live_record *hd;
     WORD pixels[SCENE_LAYERS][SCENE_PIXELS];
 } scene_record;
 
@@ -82,6 +85,7 @@ extern "C" {
 diag_frame *scene_diagnostic(const scene_record *record);
 WORD (*scene_drawing(const scene_record *record))[SCENE_PIXELS];
 int scene_init(SRWLOCK *lock);
+void scene_capture_additive(const hd_pass *pass, const WORD *pixels);
 void scene_present(HDC source, LONG epoch, LONG serial);
 /* Worker owns *record; exchange returns the oldest complete record without copying. */
 int scene_take(scene_record **record);

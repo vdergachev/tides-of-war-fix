@@ -9,6 +9,7 @@
 #include "d3d_fix.h"
 #include "iat.h"
 #include "log.h"
+#include "ship_capture.h"
 
 /* DirectX 5 interfaces and bounded scratch storage for D3DLVERTEX copies. */
 #define DEVICE_TABLE_LIMIT 4
@@ -358,6 +359,42 @@ static HRESULT STDMETHODCALLTYPE draw_indexed_primitive_hook(IDirect3DDevice2 *s
     return hr;
 }
 
+/* Selected only at installation when ship capture is armed; normal draw hooks stay unchanged. */
+static HRESULT STDMETHODCALLTYPE capture_primitive_hook(IDirect3DDevice2 *self, D3DPRIMITIVETYPE type,
+                                                        D3DVERTEXTYPE vtype, LPVOID vertices, DWORD count,
+                                                        DWORD flags)
+{
+    device_table *record = find_device_table(self);
+    if (!record || !record->draw) {
+        return E_UNEXPECTED;
+    }
+    LPVOID copy = g_white_diffuse ? white_vertices(self, vtype, vertices, count) : vertices;
+    HRESULT hr = ((draw_primitive_fn)record->draw)(self, type, vtype, copy, count, flags);
+    ship_capture_draw(self, type, vtype, copy, count, NULL, 0, flags, hr);
+    if (g_white_diffuse) {
+        report_stats();
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE capture_indexed_hook(IDirect3DDevice2 *self, D3DPRIMITIVETYPE type,
+                                                      D3DVERTEXTYPE vtype, LPVOID vertices, DWORD count,
+                                                      LPWORD indices, DWORD index_count, DWORD flags)
+{
+    device_table *record = find_device_table(self);
+    if (!record || !record->indexed) {
+        return E_UNEXPECTED;
+    }
+    LPVOID copy = g_white_diffuse ? white_vertices(self, vtype, vertices, count) : vertices;
+    HRESULT hr =
+        ((draw_indexed_fn)record->indexed)(self, type, vtype, copy, count, indices, index_count, flags);
+    ship_capture_draw(self, type, vtype, copy, count, indices, index_count, flags, hr);
+    if (g_white_diffuse) {
+        report_stats();
+    }
+    return hr;
+}
+
 static void patch_device(IDirect3DDevice2 *device)
 {
     device_table *record = find_device_table(device);
@@ -370,13 +407,15 @@ static void patch_device(IDirect3DDevice2 *device)
         record->table = device->lpVtbl;
     }
     IDirect3DDevice2Vtbl *table = record->table;
-    if (!vtable_replace((void **)&table->DrawPrimitive, (void *)(uintptr_t)draw_primitive_hook,
-                        &record->draw)) {
+    void *draw = ship_capture_enabled() ? (void *)(uintptr_t)capture_primitive_hook
+                                        : (void *)(uintptr_t)draw_primitive_hook;
+    void *indexed = ship_capture_enabled() ? (void *)(uintptr_t)capture_indexed_hook
+                                           : (void *)(uintptr_t)draw_indexed_primitive_hook;
+    if (!vtable_replace((void **)&table->DrawPrimitive, draw, &record->draw)) {
         log_line("white_diffuse: failed: DrawPrimitive vtable patch");
         return;
     }
-    if (!vtable_replace((void **)&table->DrawIndexedPrimitive, (void *)(uintptr_t)draw_indexed_primitive_hook,
-                        &record->indexed)) {
+    if (!vtable_replace((void **)&table->DrawIndexedPrimitive, indexed, &record->indexed)) {
         void *ignored;
         if (!vtable_replace((void **)&table->DrawPrimitive, record->draw, &ignored)) {
             log_line("white_diffuse: failed: DrawPrimitive rollback");
@@ -412,7 +451,7 @@ static HRESULT STDMETHODCALLTYPE create_device_hook(IDirect3D2 *self, REFCLSID g
         log_requested_guid(guid);
         hr = ((create_device_fn)g_create_device)(self, guid, surface, out);
     }
-    if (g_white_diffuse && SUCCEEDED(hr) && out && *out) {
+    if ((g_white_diffuse || ship_capture_enabled()) && SUCCEEDED(hr) && out && *out) {
         for (unsigned i = 0; i < MATERIAL_LIMIT; ++i) {
             if (g_materials[i].device == *out) {
                 memset(&g_materials[i], 0, sizeof(g_materials[i]));
@@ -452,7 +491,7 @@ static HRESULT WINAPI direct_draw_create_hook(GUID *guid, LPDIRECTDRAW *out, IUn
 
 int d3d_fix_apply(int rgb_device, int white_diffuse, DWORD untextured_color)
 {
-    if (!rgb_device && !white_diffuse) {
+    if (!rgb_device && !white_diffuse && !ship_capture_enabled()) {
         return 1;
     }
     DWORD *slot = iat_find_slot("ddraw.dll", "DirectDrawCreate");

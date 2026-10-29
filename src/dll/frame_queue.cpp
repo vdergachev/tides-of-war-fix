@@ -1,6 +1,7 @@
 #include "frame_queue.h"
 #include <string.h>
 #include <stdint.h>
+#include <cstdlib>
 /* Supported image, Draw_CDibLayout and CGameMenuWnd (IDA 0x42a37e/0x433340). */
 #define FRAME_DIB_ADDRESS   0x4cde34
 #define DRAW_STATE_ADDRESS  0x4cde48
@@ -109,6 +110,9 @@ int FrameQueue::copy_pixels(HDC source, int smooth)
 
 int FrameQueue::initialize()
 {
+    if (ship_hd_render_scale() && !worker_record_.hd) {
+        worker_record_.hd = static_cast<hd_live_record *>(calloc(1, sizeof(hd_live_record)));
+    }
     return scene_init(&lock_);
 }
 

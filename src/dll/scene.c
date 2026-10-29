@@ -9,6 +9,7 @@
 #include "patch.h"
 #include "log.h"
 #include "diag.h"
+#include "ship_capture.h"
 
 /* Scene capture for smoothing, supported image only. All offsets are observation-only. */
 #define CLOUD_CALL_ADDRESS     0x43ae82
@@ -51,6 +52,7 @@
 #define SHIP_TYPE              0x48
 #define SHIP_POSE              0x28
 #define SHIP_POINT             0x4c
+#define SHIP_OWNER             0x44
 
 static const BYTE CLOUD_BYTES[] = {0xe8, 0x59, 0x2d, 0x00, 0x00};
 static DWORD g_cloud_fn = CLOUD_ADDRESS;
@@ -137,6 +139,35 @@ static int mission(void)
 {
     int state = *(int *)DRAW_STATE_ADDRESS;
     return state == 2 || state == 3;
+}
+
+/* Shared identity reader for the observation-only ship entry hooks. No scene state. */
+int ship_capture_identity(const void *image, hd_pass *out)
+{
+    memset(out, 0, sizeof(*out));
+    __try {
+        unsigned id = *(const WORD *)((const BYTE *)image + SLOT_ID);
+        BYTE *table = *(BYTE **)GAME_TABLE_ADDRESS;
+        if (!table || id == 0xffff || id >= *(unsigned *)(table + TABLE_COUNT)) {
+            return 0;
+        }
+        BYTE *ship = (*(BYTE ***)(table + TABLE_ARRAY))[id];
+        out->id = id;
+        out->object = (uint32_t)ship;
+        out->image = (uint32_t)image;
+        out->type = *(unsigned *)(ship + SHIP_TYPE);
+        out->owner = *(unsigned *)(ship + SHIP_OWNER);
+        /* pose[3] is model heading (+0x18); scene_ship.course uses pose[2]. */
+        memcpy(out->pose, *(const void **)(ship + SHIP_POSE), sizeof(out->pose));
+        for (unsigned i = 0; i < 4; ++i) {
+            if (!isfinite(out->pose[i])) {
+                return 0;
+            }
+        }
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
 }
 
 static int copy_layer(int layer)
@@ -381,6 +412,7 @@ static void __stdcall observe_blit(const DWORD *saved)
                 draw->height = h;
                 draw->stride = source_pitch;
                 draw->key = (WORD)args[6];
+                draw->additive = 0;
                 SetRect(&draw->box, x, y, x + w, y + h);
                 for (int row = 0; row < h; ++row) {
                     memcpy(draw->pixels + row * w, (const BYTE *)args[1] + row * source_pitch, w * 2);
@@ -491,8 +523,45 @@ static void __stdcall diagnostic_draw_leave(const DWORD *saved)
 static void __stdcall observe_blend(const DWORD *saved)
 {
     (void)saved;
-    if (g_open) {
+    if (g_open && !ship_hd_render_scale()) {
         g_work->valid = 0;
+    }
+}
+
+/* HD ship rendering reuses the original ghost target as its per-ship sprite fallback. Called
+ * after the queue's EndScene and transfer, while its surface still exists. */
+void scene_capture_additive(const hd_pass *pass, const WORD *pixels)
+{
+    if (!g_open || !g_work->valid) {
+        return;
+    }
+    int w = pass->dest[2] - pass->dest[0];
+    int h = pass->dest[3] - pass->dest[1];
+    if (!pixels || g_current < 0 || g_current_id != pass->id || g_work->draw_count == SCENE_DRAWS || w < 1 ||
+        h < 1 || pass->source[0] < 0 || pass->source[1] < 0 || pass->source[2] > SCENE_SPRITE_SIZE ||
+        pass->source[3] > SCENE_SPRITE_SIZE || pass->dest[0] < 0 || pass->dest[1] < 0 ||
+        pass->dest[2] > SCENE_WIDTH || pass->dest[3] > SCENE_HEIGHT) {
+        g_work->valid = 0;
+        return;
+    }
+    scene_draw *draw = &g_work->draws[g_work->draw_count++];
+    draw->ship = (unsigned)g_current;
+    draw->id = pass->id;
+    draw->pass = g_mode == 1 ? 0 : 1;
+    draw->width = w;
+    draw->height = h;
+    draw->stride = SCENE_SPRITE_SIZE * 2;
+    draw->key = 0;
+    draw->additive = 1;
+    memcpy(&draw->box, pass->dest, sizeof(draw->box));
+    for (int row = 0; row < h; ++row) {
+        memcpy(draw->pixels + row * w, pixels + (pass->source[1] + row) * SCENE_SPRITE_SIZE + pass->source[0],
+               w * 2);
+    }
+    if (g_current < SCENE_SHIPS && draw->pass == 0) {
+        scene_ship *ship = &g_work->ships[g_current];
+        ship->box = draw->box;
+        ship->wake_stern = wake_hull_stern(ship, draw, g_work->camera, g_work->view);
     }
 }
 
@@ -723,6 +792,11 @@ int scene_init(SRWLOCK *lock)
         log_line("scene: unexpected hook bytes; plain frames only");
         return 0;
     }
+    if (ship_hd_render_scale()) {
+        for (unsigned i = 0; i <= SCENE_RING; ++i) {
+            g_storage[i].hd = calloc(1, sizeof(hd_live_record));
+        }
+    }
     LARGE_INTEGER frequency;
     QueryPerformanceFrequency(&frequency);
     g_frequency = frequency.QuadPart;
@@ -828,6 +902,7 @@ void scene_present(HDC source, LONG epoch, LONG serial)
     if (!g_work->valid) {
         ++g_failures;
     }
+    ship_capture_publish(g_work->hd);
     g_open = 0;
     g_last_step = g_step;
     g_had_record = 1;

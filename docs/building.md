@@ -46,6 +46,13 @@ Target: Windows 7 SP1+ (`_WIN32_WINNT=0x0601`, `/SUBSYSTEM:…,6.01`), static CR
 | `src/dll/wake_field.cpp`, `wake_layer.cpp`, `wake_geometry.h`, `wake_config.c` (+ `.h`) | ship wake: ripple field, bubbles, stern point, settings |
 | `src/dll/cloud_art.cpp`, `cloud_art.h`, `cloud_art_gpu.h` | cloud sprites from the game's own art |
 | `src/dll/scaling.c`, `display.c` | integer scaling, mouse/dialog/font/cursor mapping, borderless fullscreen |
+| `src/dll/ship_capture.c`, `ship_capture.h` | capture the game's ship geometry and textures; live rendering hooks |
+| `src/dll/ship_gpu.cpp`, `ship_gpu.h`, `ship_gpu.hlsl`, `ship_gpu_vs.h`, `ship_gpu_ps.h`, `ship_transfer_ps.*` | high-resolution ship rendering and image transfer shaders |
+| `src/dll/ship_live.h` | shared live ship data |
+| `src/dll/ship_dump.h` | one-step ship dump format for offline rendering |
+| `src/dll/cargo_pause.c`, `cargo_pause.h` | hide Cargo and its tabs while paused, restore on resume |
+| `src/dll/gun_smoke.c`, `gun_smoke.h` | optional smoke on every successful shot |
+| `tools/ship_replay.cpp`, `tools/build_ship_replay.cmd` | offline ship dump renderer; run the script from the repository root to build `build/ship_replay.exe` |
 | `src/patcher/tow_patch.c` | patcher (console and double-click dialog modes) |
 
 The DLL links `d3d11.lib` and `dxgi.lib` in addition to the existing Windows libraries.

@@ -11,6 +11,7 @@ class OutputWindow
 {
   public:
     void hide(const char *reason = "external_partial_blit");
+    void hide_for_blit(HDC destination);
     int frame(HWND destination, HDC source, int factor);
     int begin_gdi_refresh(int force);
     void end_gdi_refresh(int ok);
@@ -23,6 +24,7 @@ class OutputWindow
     friend class Renderer;
     static BOOL CALLBACK find_dialog(HWND hwnd, LPARAM parameter);
     int blocked_by_dialog(void);
+    int yesno_blit(HWND window);
     void update_window(void);
     void refresh_gdi(int force);
     int snapshot_current(void);
@@ -68,5 +70,7 @@ class OutputWindow
     int gdi_state_;
     LONG gdi_epoch_;
     LONG gdi_refresh_count_;
+    LONG skipped_hide_memory_dc_;
+    LONG skipped_hide_popup_;
 };
 #endif

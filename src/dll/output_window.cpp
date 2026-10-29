@@ -9,6 +9,8 @@
 #include <new>
 
 #define DRAW_STATE_ADDRESS 0x4cde48
+/* Yes/No background is 288x288 before scaling. */
+#define YESNO_SIZE 288
 
 int OutputWindow::snapshot_current(void)
 {
@@ -67,6 +69,40 @@ void OutputWindow::refresh_gdi(int force)
 
     /* Only this UI producer exchanges latest_; the worker only reads it. */
     end_gdi_refresh(scaling_refresh_gdi(frame_window_, queue.latest_, factor_));
+}
+
+int OutputWindow::yesno_blit(HWND window)
+{
+    HWND root = GetAncestor(window, GA_ROOT);
+    WCHAR name[64];
+    RECT client = {};
+    if (!GetClassNameW(root, name, ARRAYSIZE(name)) || wcscmp(name, L"#32770") ||
+        !GetClientRect(root, &client)) {
+        return 0;
+    }
+
+    return (client.right == YESNO_SIZE && client.bottom == YESNO_SIZE) ||
+           (client.right == YESNO_SIZE * factor_ && client.bottom == YESNO_SIZE * factor_);
+}
+
+void OutputWindow::hide_for_blit(HDC destination)
+{
+    if (!child_ || !wanted_) {
+        return;
+    }
+
+    DWORD error = GetLastError();
+    HWND window = WindowFromDC(destination);
+    if (!window || GetObjectType(destination) != OBJ_DC) {
+        InterlockedIncrement(&skipped_hide_memory_dc_);
+    } else if (GetAncestor(window, GA_ROOT) == root_ || blocked_by_dialog() || yesno_blit(window)) {
+        /* Preserve Yes/No opening and disabled-owner/child-dialog fallback.
+         * Owned modeless popups have their own surface, unlike frame children. */
+        hide();
+    } else {
+        InterlockedIncrement(&skipped_hide_popup_);
+    }
+    SetLastError(error);
 }
 
 void OutputWindow::hide(const char *reason)

@@ -6,6 +6,7 @@
 #include "iat.h"
 #include "patch.h"
 #include "log.h"
+#include "cargo_pause.h"
 
 /* winmm callbacks of the frame object (dwUser): step posts 0x8001, draw posts 0x8002. */
 #define STEP_CALLBACK_ADDRESS 0x446ed0
@@ -70,6 +71,8 @@ typedef struct {
 
 static time_set_fn g_time_set;
 static peek_fn g_peek;
+static int g_poll_installed;
+static int g_watchdog_enabled;
 
 /* Draw slot: 0 = none, DRAW_CREATING, or the live winmm ID. Shared with the winmm thread. */
 static LONG volatile g_draw_live;
@@ -326,8 +329,11 @@ static BOOL WINAPI guard_peek(LPMSG msg, HWND hwnd, UINT first, UINT last, UINT 
     if (_ReturnAddress() == (void *)(uintptr_t)RUN_PEEK_RETURN) {
         DWORD error = GetLastError();
         DWORD now = GetTickCount();
-        step_watch(now);
-        report(now);
+        cargo_pause_poll();
+        if (g_watchdog_enabled) {
+            step_watch(now);
+            report(now);
+        }
         SetLastError(error);
     }
     return g_peek(msg, hwnd, first, last, remove);
@@ -339,6 +345,28 @@ static int code_matches(void)
            patch_check((void *)DRAW_CALLBACK_ADDRESS, DRAW_CALLBACK_BYTES, sizeof(DRAW_CALLBACK_BYTES)) &&
            patch_check((void *)STEP_REARM_ADDRESS, STEP_REARM_BYTES, sizeof(STEP_REARM_BYTES)) &&
            patch_check((void *)RUN_PEEK_ADDRESS, RUN_PEEK_BYTES, sizeof(RUN_PEEK_BYTES));
+}
+
+/* Shared UI poll also works with timer_guard disabled; no timer policy is enabled. */
+int timer_guard_ui_poll_apply(void)
+{
+    if (g_poll_installed) {
+        return 1;
+    }
+    DWORD *slot = iat_find_slot("user32.dll", "PeekMessageA");
+    if (!patch_check((void *)RUN_PEEK_ADDRESS, RUN_PEEK_BYTES, sizeof(RUN_PEEK_BYTES)) ||
+        slot != (DWORD *)PEEK_MESSAGE_SLOT || !*slot) {
+        log_line("ui_poll: failed: unexpected PeekMessageA call or import");
+        return 0;
+    }
+    g_peek = (peek_fn)(uintptr_t)*slot;
+    int result = iat_replace(slot, (void *)(uintptr_t)g_peek, (void *)(uintptr_t)guard_peek);
+    if (result != IAT_OK) {
+        log_line("ui_poll: failed: PeekMessageA hook result=%d", result);
+        return 0;
+    }
+    g_poll_installed = 1;
+    return 1;
 }
 
 int timer_guard_apply(void)
@@ -362,9 +390,9 @@ int timer_guard_apply(void)
         return 0;
     }
 
-    result = iat_replace(peek_slot, (void *)(uintptr_t)g_peek, (void *)(uintptr_t)guard_peek);
-    if (result != IAT_OK) {
-        log_line("timer_guard: ok without step watchdog (PeekMessageA hook result=%d)", result);
+    g_watchdog_enabled = 1;
+    if (!timer_guard_ui_poll_apply()) {
+        log_line("timer_guard: ok without step watchdog");
         return 1;
     }
 

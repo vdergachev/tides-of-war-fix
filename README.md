@@ -65,6 +65,10 @@ For reference, the main keys (`1` = on, `0` = off):
 | `[d3d11]` | `enabled`, `smooth` | `1` | set either to `0` to switch off the D3D11 path if you see problems |
 | `[wake]` | `enabled` | `1` | wake behind every ship |
 | `[timer_guard]` | `enabled` | `1` | no frozen world after fast clicks on ships |
+| `[hd_ships]` | render_scale | 16 (clamped to N) | ship detail: 0 off, 1 original look, 2/3 coarser pixels, N full sharpness; D3D11 smooth scene only |
+| `[hd_ships]` | dump_step | 0 | developer capture of one mission step; 0 off |
+| `[cargo_pause]` | enabled | 1 | hide Cargo and its tabs during single-player pause |
+| `[gun_smoke]` | every_shot | 1 | smoke on every successful shot; requires the in-game smoke option |
 
 A log is written to `tow_fix.log` next to `TOW.exe`; please attach it to bug reports.
 

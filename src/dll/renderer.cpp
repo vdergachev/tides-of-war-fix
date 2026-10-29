@@ -303,9 +303,11 @@ void Renderer::log_counters(DWORD *last)
     LONG dropped = FrameQueue::atomic_read(&host_.dropped_);
     LONG stale = FrameQueue::atomic_read(&host_.stale_);
     diag_log("d3d11: received_interval=%ld replaced_interval=%ld stale_epoch_interval=%ld "
-             "gdi_refresh_interval=%ld",
+             "gdi_refresh_interval=%ld skipped_hide_memory_dc_interval=%ld skipped_hide_popup_interval=%ld",
              received - last_received_, dropped - last_dropped_ - (stale - last_stale_), stale - last_stale_,
-             InterlockedExchange(&host_.gdi_refresh_count_, 0));
+             InterlockedExchange(&host_.gdi_refresh_count_, 0),
+             InterlockedExchange(&host_.skipped_hide_memory_dc_, 0),
+             InterlockedExchange(&host_.skipped_hide_popup_, 0));
     last_received_ = received;
     last_dropped_ = dropped;
     last_stale_ = stale;
@@ -339,7 +341,10 @@ void Renderer::render_next(FrameState &frame)
     if (host_.smooth_) {
         scene_.frame_begin();
         frame.scene_epoch = FrameQueue::atomic_read(&host_.queue.epoch_);
-        scene_.update(gpu_.device.Get(), gpu_.context.Get(), frame.scene_epoch);
+        RECT output = {};
+        GetClientRect(host_.child_, &output);
+        scene_.update(gpu_.device.Get(), gpu_.context.Get(), frame.scene_epoch, (UINT)max(1, output.right),
+                      (UINT)max(1, output.bottom));
     }
     /* Consume the latest plain frame after scene work. Intermediate snapshots
      * stay RGB565 in CPU memory; conversion/upload waits for fallback drawing. */

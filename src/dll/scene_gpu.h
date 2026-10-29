@@ -4,6 +4,7 @@
 #include "cloud_art_gpu.h"
 #include "texture2d.h"
 #include "wake_layer.h"
+#include "ship_gpu.h"
 using Microsoft::WRL::ComPtr;
 #define REGION_PRECLOUD 5
 #define REGION_COUNT    6
@@ -33,7 +34,10 @@ struct SceneEntry {
     unsigned draw_count;
     unsigned draw_ship[SCENE_DRAWS];
     unsigned draw_pass[SCENE_DRAWS];
+    unsigned draw_additive[SCENE_DRAWS];
     Texture2D draws[SCENE_DRAWS];
+    Texture2D hd_draws[SCENE_DRAWS];
+    hd_pass hd_passes[SCENE_DRAWS];
     std::unique_ptr<WORD[]> wake_bottom;
 };
 
@@ -71,7 +75,7 @@ class SceneCompositor
 
     void release(void);
     int init(ID3D11Device *device);
-    void update(ID3D11Device *device, ID3D11DeviceContext *context, LONG epoch);
+    void update(ID3D11Device *device, ID3D11DeviceContext *context, LONG epoch, UINT width, UINT height);
     int draw(ID3D11DeviceContext *context, UINT width, UINT height, LONG epoch);
     int active(void);
     void counters(unsigned *draws, unsigned *uploads, unsigned long long *bytes);
@@ -122,6 +126,23 @@ class SceneCompositor
     void draw_base(ID3D11DeviceContext *context, const SceneEntry *entry, const SceneEntry *edge,
                    const double *camera, const double *shift, UINT width, UINT height);
 
+    void initialize_hd(ID3D11Device *device, ID3D11DeviceContext *context);
+    bool build_hd_draw(ID3D11DeviceContext *context, SceneEntry *entry, const scene_record *record,
+                       unsigned index, unsigned side, unsigned &triangles);
+    void build_hd(ID3D11Device *device, ID3D11DeviceContext *context, SceneEntry *entry,
+                  const scene_record *record, UINT width, UINT height);
+    bool draw_hd(ID3D11DeviceContext *context, const SceneEntry *entry, unsigned index, double dx, double dy,
+                 UINT width, UINT height);
+    std::unique_ptr<ShipGpu> hd_;
+    ComPtr<ID3D11PixelShader> hd_transfer_;
+    ComPtr<ID3D11Buffer> hd_constants_;
+    ComPtr<ID3D11BlendState> hd_add_;
+    unsigned hd_render_scale_ = 0;
+    unsigned ships_hd_ = 0;
+    unsigned ships_fallback_ = 0;
+    unsigned triangles_hd_ = 0;
+    unsigned hd_last_uploads_ = 0;
+    double hd_ms_ = 0;
     FrameQueue &queue_;
     SceneDiagnostic *diagnostics_ = nullptr;
     DWORD diagnostic_owner_time_ = {};

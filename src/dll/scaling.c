@@ -2031,7 +2031,7 @@ static BOOL WINAPI frame_blit(HDC dst, int x, int y, int width, int height, HDC 
     }
     if (!g_drawing &&
         (x || y || sx || sy || width != LOGICAL_WIDTH || height != LOGICAL_HEIGHT || rop != SRCCOPY)) {
-        d3d11_out_hide();
+        d3d11_out_hide_for_blit(dst);
     }
     if (!g_factor && !g_drawing && x == 0 && y == 0 && sx == 0 && sy == 0 && width == LOGICAL_WIDTH &&
         height == LOGICAL_HEIGHT && rop == SRCCOPY && d3d11_out_frame(WindowFromDC(dst), src, 1)) {
@@ -2963,7 +2963,7 @@ static BOOL WINAPI copy_blit(HDC dst, int x, int y, int w, int h, HDC src, int s
     if (g_drawing) {
         return g_bitblt(dst, x, y, w, h, src, sx, sy, rop);
     }
-    d3d11_out_hide();
+    d3d11_out_hide_for_blit(dst);
     if (!g_factor) {
         return g_bitblt(dst, x, y, w, h, src, sx, sy, rop);
     }

@@ -13,13 +13,16 @@
 #include "draw_sync.h"
 #include "idle_wait.h"
 #include "timer_guard.h"
+#include "cargo_pause.h"
+#include "gun_smoke.h"
 #include "d3d_fix.h"
+#include "ship_capture.h"
 #include "scale.h"
 #include "display.h"
 #include "d3d11_out.h"
 #include "../common/sha256.h"
 
-#define TOW_FIX_VERSION "0.16.0"
+#define TOW_FIX_VERSION "0.17.0"
 
 /* Supported game image and CRT entry point, before any game initialization. */
 #define GAME_IMAGE_BASE    0x400000
@@ -30,6 +33,7 @@ static const uint8_t ENTRY_BYTES[5] = {0x55, 0x8b, 0xec, 0x6a, 0xff};
 static uint8_t g_original[5];
 static uint8_t g_hook[5];
 static DWORD g_entry = GAME_ENTRY_ADDRESS;
+static char g_text_hash[65];
 
 static int hash_text_section(char hash[65])
 {
@@ -64,6 +68,7 @@ static int accept_game_version(void)
     }
 
     log_line("exe .text SHA-256: %s", hash);
+    strcpy_s(g_text_hash, sizeof(g_text_hash), hash);
     if (!strcmp(hash, "a84e1f6f6481e6ef70d6f7a1cc2222192c42443a87e8f8c990167e228f5f6cfa")) {
         log_line("exe version accepted: original");
     } else if (!strcmp(hash, "0d92125629563c7d95fcd7769973a4de2fef80316bceee45e0aecaaebd4777f2")) {
@@ -111,6 +116,7 @@ typedef struct {
     int idle_wait;
     int max_wait_ms;
     int timer_guard;
+    int gun_smoke;
     int rgb_device;
     int white_diffuse;
     DWORD untextured_color;
@@ -128,6 +134,10 @@ static int read_settings(const char *dir, tow_settings *settings)
     strcpy_s(path, sizeof(path), dir);
     strcat_s(path, sizeof(path), "tow_fix.ini");
     wake_configure(path);
+    ship_capture_configure(path);
+    cargo_pause_configure(path);
+    settings->gun_smoke = (int)GetPrivateProfileIntA("gun_smoke", "every_shot", 0, path);
+    log_line("[gun_smoke] every_shot=%d", settings->gun_smoke);
     if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
         log_line("tow_fix.ini missing; all fixes off");
     }
@@ -199,8 +209,10 @@ static void __cdecl tow_init(void)
         return;
     }
     if (!accept_game_version()) {
+        log_line("gun_smoke: skipped (unknown executable)");
         return;
     }
+    gun_smoke_apply(settings.gun_smoke);
     log_line("game_folder: %s", settings.game_folder ? "enabled" : "disabled");
     if (settings.game_folder) {
         game_folder_apply(dir);
@@ -231,11 +243,16 @@ static void __cdecl tow_init(void)
     if (settings.timer_guard) {
         timer_guard_apply();
     }
+    if (cargo_pause_enabled()) {
+        int ok = timer_guard_ui_poll_apply();
+        log_line("cargo_pause: %s", ok ? "ready (single player only)" : "UI poll unavailable");
+    }
     log_line("rgb_device: %s", settings.rgb_device ? "enabled" : "disabled");
     log_line("white_diffuse: %s", settings.white_diffuse ? "enabled" : "disabled");
-    if (settings.rgb_device || settings.white_diffuse) {
+    if (settings.rgb_device || settings.white_diffuse || ship_capture_enabled()) {
         d3d_fix_apply(settings.rgb_device, settings.white_diffuse, settings.untextured_color);
     }
+    ship_capture_apply(g_text_hash);
     diag_configure(dir);
     d3d11_out_configure(dir);
     scaling_apply(dir);

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.17.0
+
+- Sharp high-resolution ships drawn from the game's own 3D models.
+- Choose ship detail with `[hd_ships]` render_scale: 0 turns it off, 1 keeps the original look,
+  2/3 use coarser pixels, and N (the output scale) gives full sharpness.
+- Optional one-step ship dump for developers: `[hd_ships]` dump_step selects the mission step to capture;
+  0 disables it. The offline ship_replay tool can render the captured geometry.
+- Moving the mouse over the Cargo window no longer makes the scene jump.
+- Cargo and its tabs hide while the game is paused and return on resume (`[cargo_pause]`).
+- Gun smoke on every successful shot (`[gun_smoke]` every_shot); the in-game smoke option must be enabled.
+- Ship rendering fixes, with the original ship image used when model data or GPU rendering is unavailable.
+
 ## 0.16.0
 
 - Wake behind every ship: the game's own ripple algorithm plus bubbles, drawn in the smooth scene on the sea under
