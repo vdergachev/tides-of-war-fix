@@ -17,12 +17,14 @@
 #include "gun_smoke.h"
 #include "d3d_fix.h"
 #include "ship_capture.h"
+#include "smooth_balls.h"
+#include "smooth_fire.h"
 #include "scale.h"
 #include "display.h"
 #include "d3d11_out.h"
 #include "../common/sha256.h"
 
-#define TOW_FIX_VERSION "0.17.0"
+#define TOW_FIX_VERSION "0.18.0"
 
 /* Supported game image and CRT entry point, before any game initialization. */
 #define GAME_IMAGE_BASE    0x400000
@@ -135,6 +137,8 @@ static int read_settings(const char *dir, tow_settings *settings)
     strcat_s(path, sizeof(path), "tow_fix.ini");
     wake_configure(path);
     ship_capture_configure(path);
+    smooth_balls_configure(path);
+    smooth_fire_configure(path);
     cargo_pause_configure(path);
     settings->gun_smoke = (int)GetPrivateProfileIntA("gun_smoke", "every_shot", 0, path);
     log_line("[gun_smoke] every_shot=%d", settings->gun_smoke);
@@ -213,6 +217,7 @@ static void __cdecl tow_init(void)
         return;
     }
     gun_smoke_apply(settings.gun_smoke);
+    wake_apply();
     log_line("game_folder: %s", settings.game_folder ? "enabled" : "disabled");
     if (settings.game_folder) {
         game_folder_apply(dir);

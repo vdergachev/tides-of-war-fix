@@ -52,6 +52,12 @@ Target: Windows 7 SP1+ (`_WIN32_WINNT=0x0601`, `/SUBSYSTEM:…,6.01`), static CR
 | `src/dll/ship_dump.h` | one-step ship dump format for offline rendering |
 | `src/dll/cargo_pause.c`, `cargo_pause.h` | hide Cargo and its tabs while paused, restore on resume |
 | `src/dll/gun_smoke.c`, `gun_smoke.h` | optional smoke on every successful shot |
+| `src/dll/smooth_balls.c` (+ `.h`), `ball_geometry.h`, `ball_vs.*` | smooth cannonballs: per-shot capture and drawing |
+| `src/dll/smooth_fire.c` (+ `.h`) | fire and damage smoke attached to their ship |
+| `src/dll/boat_oars.cpp` (+ `.h`), `boat_oars.hlsl`, `boat_oars_vs.h`, `boat_oars_ps.h` | animated boat oars |
+| `src/dll/scene_timeline.h` | delayed display clock of the smooth scene (never goes back after a pause) |
+| `tools/oars_preview.cpp`, `tools/build_oars_preview.cmd` | offline oar preview |
+| `tools/timeline_check.cpp`, `tools/build_timeline_check.cmd` | synthetic pause/resume timeline check |
 | `tools/ship_replay.cpp`, `tools/build_ship_replay.cmd` | offline ship dump renderer; run the script from the repository root to build `build/ship_replay.exe` |
 | `src/patcher/tow_patch.c` | patcher (console and double-click dialog modes) |
 

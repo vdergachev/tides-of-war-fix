@@ -208,7 +208,7 @@ void Renderer::upload_snapshot(void)
     }
 }
 
-HRESULT Renderer::present_frame(LONG epoch, LONG snapshot_epoch, int *composed)
+HRESULT Renderer::present_frame(LONG epoch, LONG snapshot_epoch, LONG snapshot_serial, int *composed)
 {
     RECT rect;
     if (!GetClientRect(host_.child_, &rect) || rect.right <= 0 || rect.bottom <= 0) {
@@ -240,7 +240,10 @@ HRESULT Renderer::present_frame(LONG epoch, LONG snapshot_epoch, int *composed)
         gpu_.context->PSSetShaderResources(0, 1, gpu_.view.GetAddressOf());
         gpu_.context->Draw(4, 0);
         ++draws_;
-        scene_.plain_frame();
+        scene_.plain_frame(epoch, snapshot_serial);
+        if (host_.smooth_) {
+            scene_.draw_pause(gpu_.context.Get(), gpu_.view.Get(), gpu_.width, gpu_.height, epoch);
+        }
     }
     ++rendered_;
     back_width_ = gpu_.width;
@@ -371,7 +374,7 @@ void Renderer::render_next(FrameState &frame)
         InterlockedIncrement(&host_.stale_);
         return;
     }
-    frame.hr = present_frame(epoch, frame.snapshot_epoch, &frame.composed);
+    frame.hr = present_frame(epoch, frame.snapshot_epoch, frame.snapshot_serial, &frame.composed);
     if (frame.hr == S_FALSE) {
         return;
     }

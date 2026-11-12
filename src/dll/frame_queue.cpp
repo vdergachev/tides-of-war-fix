@@ -20,6 +20,16 @@ LONG FrameQueue::atomic_read(LONG *value)
     return InterlockedCompareExchange(value, 0, 0);
 }
 
+int FrameQueue::mission_supported(void)
+{
+    __try {
+        int state = *(const int *)(uintptr_t)DRAW_STATE_ADDRESS;
+        return state == 2 || state == 3;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
 int FrameQueue::screen_supported(void)
 {
     int state = *(const int *)(uintptr_t)DRAW_STATE_ADDRESS;

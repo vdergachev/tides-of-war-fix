@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.18.0
+
+- Small boats (launches and canoes) move smoothly with the scene and are drawn sharp like ships.
+- Boats row: animated oars along both sides, stroke rate follows the boat's speed, oars rest when it stops
+  (`[boat_oars]`).
+- No wake, bubbles or ripples around boats by default (`[wake] boats=0`; `1` brings them back).
+- Cannonballs fly smoothly between game steps instead of jumping (`[smooth_balls]`); hits and ballistics are unchanged.
+- Fire and damage smoke on a burning ship move smoothly together with the ship (`[smooth_fire]`).
+- No backward jump of the scene after unpausing while ships move.
+- Ships stay sharp while the game is paused; the PAUSED banner and menus stay on top.
+
 ## 0.17.0
 
 - Sharp high-resolution ships drawn from the game's own 3D models.

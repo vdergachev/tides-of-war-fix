@@ -69,6 +69,10 @@ For reference, the main keys (`1` = on, `0` = off):
 | `[hd_ships]` | dump_step | 0 | developer capture of one mission step; 0 off |
 | `[cargo_pause]` | enabled | 1 | hide Cargo and its tabs during single-player pause |
 | `[gun_smoke]` | every_shot | 1 | smoke on every successful shot; requires the in-game smoke option |
+| `[smooth_balls]` | `enabled` | `1` | cannonballs fly smoothly between game steps |
+| `[smooth_fire]` | `enabled` | `1` | fire and damage smoke move smoothly with their ship |
+| `[boat_oars]` | `enabled` | `1` | animated oars on boats |
+| `[wake]` | `boats` | `0` | wake, bubbles and ripples around boats |
 
 A log is written to `tow_fix.log` next to `TOW.exe`; please attach it to bug reports.
 

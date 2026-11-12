@@ -5,6 +5,8 @@
 #include "texture2d.h"
 #include "wake_layer.h"
 #include "ship_gpu.h"
+#include "boat_oars.h"
+#include "scene_timeline.h"
 using Microsoft::WRL::ComPtr;
 #define REGION_PRECLOUD 5
 #define REGION_COUNT    6
@@ -27,6 +29,13 @@ struct SceneEntry {
     RECT view;
     double qpc;
     scene_ship ships[SCENE_SHIPS];
+    int balls_valid;
+    unsigned ball_count;
+    POINT ball_offset;
+    scene_ball balls[BALL_LIMIT];
+    unsigned effect_count;
+    unsigned effect_ship[SCENE_EFFECTS];
+    Texture2D effects[SCENE_EFFECTS];
     unsigned cloud_flags;
     int split_clouds;
     scene_cloud clouds[SCENE_CLOUDS];
@@ -78,15 +87,22 @@ class SceneCompositor
     void update(ID3D11Device *device, ID3D11DeviceContext *context, LONG epoch, UINT width, UINT height);
     int draw(ID3D11DeviceContext *context, UINT width, UINT height, LONG epoch);
     int active(void);
+    void draw_pause(ID3D11DeviceContext *context, ID3D11ShaderResourceView *plain, UINT width, UINT height,
+                    LONG epoch);
     void counters(unsigned *draws, unsigned *uploads, unsigned long long *bytes);
     void log(void);
     void frame_begin(void);
     void frame_end(void);
 
-    void plain_frame(void)
+    /* A plain capture of this epoch/serial was drawn instead of the smooth scene. */
+    void plain_frame(LONG epoch, LONG serial)
     {
         if (stalled_) {
             ++stall_plain_;
+        }
+
+        if (epoch == epoch_) {
+            timeline_.show_plain(serial);
         }
     }
 
@@ -102,8 +118,12 @@ class SceneCompositor
     void release_entry(SceneEntry *entry);
     void reset_timeline(void);
     void check_stall(void);
+    void enter_stall(double latest);
+    double stall_ms(void);
+    void check_gap(double qpc);
     int assign_masks(const scene_record *record);
     int build_draw(ID3D11Device *device, SceneEntry *entry, const scene_record *record, unsigned index);
+    int build_effects(ID3D11Device *device, SceneEntry *entry, const scene_record *record);
     int upload_pixels(ID3D11Device *device, Texture2D *out, RECT bounds);
     int region_pixel(const scene_record *record, unsigned region, int p);
     unsigned source_layer(unsigned region);
@@ -111,7 +131,7 @@ class SceneCompositor
     void find_bounds(const scene_record *record);
     int build_region(ID3D11Device *device, SceneEntry *entry, const scene_record *record, unsigned index);
     void discard_first(void);
-    const scene_ship *find_ship(const SceneEntry *entry, uintptr_t ptr);
+    const scene_ship *find_ship(const SceneEntry *entry, uintptr_t ptr, unsigned id = 0xffff);
     void camera_fraction(const SceneEntry *entry, uintptr_t follow, double *camera);
     int classify(const SceneEntry *before, const SceneEntry *entry, double *cam0, double *cam1);
     void draw_sprite(ID3D11DeviceContext *context, const Texture2D *region, double dx, double dy, RECT clip,
@@ -121,6 +141,12 @@ class SceneCompositor
     int cloud_snap(const SceneEntry *before, const SceneEntry *entry, unsigned i);
     void draw_clouds(ID3D11DeviceContext *context, const SceneEntry *before, const SceneEntry *entry,
                      int reason, double alpha, const double *shift, UINT width, UINT height);
+    int prepare_ball_tile(ID3D11DeviceContext *context);
+    void draw_balls(ID3D11DeviceContext *context, const SceneEntry *before, const SceneEntry *entry,
+                    int reason, double alpha, const double *shift, UINT width, UINT height);
+    void append_ball(const scene_ball *ball, double x, double y, const SceneEntry *entry,
+                     const double *shift);
+    void flush_balls(ID3D11DeviceContext *context, const SceneEntry *entry, UINT width, UINT height);
     void observe_motion(const SceneEntry *before, const SceneEntry *entry, const double *camera,
                         const double *cam0, const double *cam1, double positions[SCENE_SHIPS][2]);
     void draw_base(ID3D11DeviceContext *context, const SceneEntry *entry, const SceneEntry *edge,
@@ -133,10 +159,24 @@ class SceneCompositor
                   const scene_record *record, UINT width, UINT height);
     bool draw_hd(ID3D11DeviceContext *context, const SceneEntry *entry, unsigned index, double dx, double dy,
                  UINT width, UINT height);
+    void draw_oars(ID3D11DeviceContext *context, const SceneEntry *entry, const SceneEntry *before,
+                   unsigned ship_index, double dx, double dy, double alpha, int reason, UINT width,
+                   UINT height);
+    SceneEntry pause_entry_ = {};
+    bool pause_drawing_ = false;
+    BoatOars oars_;
     std::unique_ptr<ShipGpu> hd_;
     ComPtr<ID3D11PixelShader> hd_transfer_;
     ComPtr<ID3D11Buffer> hd_constants_;
     ComPtr<ID3D11BlendState> hd_add_;
+    Texture2D ball_tile_;
+    ComPtr<ID3D11VertexShader> ball_vs_;
+    ComPtr<ID3D11Buffer> ball_placements_;
+    DWORD ball_pixels_[BALL_ATLAS * BALL_ATLAS] = {};
+    FLOAT ball_rects_[BALL_LIMIT][4] = {};
+    unsigned ball_batch_count_ = 0;
+    unsigned balls_drawn_ = 0;
+    unsigned balls_fallback_ = 0;
     unsigned hd_render_scale_ = 0;
     unsigned ships_hd_ = 0;
     unsigned ships_fallback_ = 0;
@@ -177,8 +217,8 @@ class SceneCompositor
     unsigned stall_plain_ = {};
     double stall_max_ms_ = {};
     double frequency_ = {};
-    double time_ = {};
-    double now_ = {};
+    SceneTimeline timeline_;
+    unsigned gap_resets_ = {};
     double interval_ = {};
     uintptr_t follow_ = {};
     double changed_pair_ = {};

@@ -51,7 +51,7 @@ class Renderer
     HRESULT create_gpu(void);
     HRESULT resize_gpu(UINT width, UINT height);
     void upload_snapshot(void);
-    HRESULT present_frame(LONG epoch, LONG snapshot_epoch, int *composed);
+    HRESULT present_frame(LONG epoch, LONG snapshot_epoch, LONG snapshot_serial, int *composed);
     void log_counters(DWORD *last);
     OutputWindow &host_;
     SceneCompositor scene_;

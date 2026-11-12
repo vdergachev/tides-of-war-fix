@@ -13,6 +13,7 @@ class FrameQueue
   public:
     static LONG atomic_read(LONG *value);
     static int screen_supported(void);
+    static int mission_supported(void);
     static BYTE *source_dib(HDC source);
     int copy_pixels(HDC source, int smooth);
     FrameQueue() noexcept = default;

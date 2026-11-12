@@ -8,6 +8,7 @@
 #include "cloud_art.h"
 #include <stdlib.h>
 #include "scene_vs.h"
+#include "ball_vs.h"
 #include "scene_base_ps.h"
 #define tow_d3d11_ps tow_scene_layer_ps
 #include "d3d11_ps.h"
@@ -23,6 +24,9 @@ using Microsoft::WRL::ComPtr;
 
 /* Require stable capture before restoring the delayed timeline. */
 static const unsigned SCENE_RECOVERY_RECORDS = 3;
+
+/* Keep the compiled instance shader's constant layout and atlas grid in sync. */
+static_assert(BALL_LIMIT == 1024 && BALL_ATLAS_SIDE == 32, "Rebuild ball_vs for the new batch layout");
 
 double SceneCompositor::ticks(void)
 {
@@ -46,6 +50,9 @@ DWORD SceneCompositor::color(WORD value)
 
 void SceneCompositor::release_entry(SceneEntry *entry)
 {
+    for (auto &effect : entry->effects) {
+        effect = {};
+    }
     for (unsigned i = 0; i < REGION_COUNT; ++i) {
         entry->regions[i].view.Reset();
         entry->regions[i].texture.Reset();
@@ -59,6 +66,8 @@ void SceneCompositor::release_entry(SceneEntry *entry)
 
 void SceneCompositor::reset_timeline(void)
 {
+    pause_entry_ = {};
+    oars_.reset();
     if (wake_) {
         wake_->reset();
     }
@@ -74,8 +83,8 @@ void SceneCompositor::reset_timeline(void)
         resources_.entries[i].wake_bottom = std::move(bottom);
     }
     count_ = 0;
-    time_ = 0;
-    now_ = 0;
+    /* Keep the shown step: the next timeline must not start before it. */
+    timeline_.reset_clock();
     interval_ = 0;
     follow_ = 0;
     changed_pair_ = 0;
@@ -93,15 +102,46 @@ void SceneCompositor::check_stall(void)
         return;
     }
     double age = max(0, (ticks() - latest) * 1000.0 / frequency_);
-    if (age > 2.0 * game_speed_step_delay()) {
+    if (age > stall_ms()) {
         stall_max_ms_ = max(stall_max_ms_, age);
         if (!stalled_ || count_) {
             /* Drop the frozen timeline; smoothing resumes after K fresh complete records. */
-            reset_timeline();
-            stalled_ = true;
-            stall_qpc_ = latest;
+            enter_stall(latest);
         }
     }
+}
+
+void SceneCompositor::enter_stall(double latest)
+{
+    SceneEntry saved = {};
+    if (count_) {
+        saved = std::move(resources_.entries[count_ - 1]);
+    }
+    reset_timeline();
+    pause_entry_ = std::move(saved);
+    stalled_ = true;
+    stall_qpc_ = latest;
+}
+
+double SceneCompositor::stall_ms(void)
+{
+    return 2.0 * game_speed_step_delay();
+}
+
+/* Records taken together can still span a pause: never pair across it. */
+void SceneCompositor::check_gap(double qpc)
+{
+    if (!count_ || !frequency_) {
+        return;
+    }
+
+    double latest = resources_.entries[count_ - 1].qpc;
+    if ((qpc - latest) * 1000.0 / frequency_ <= stall_ms()) {
+        return;
+    }
+
+    enter_stall(latest);
+    ++gap_resets_;
 }
 
 void SceneCompositor::release(void)
@@ -111,10 +151,14 @@ void SceneCompositor::release(void)
     }
     reset_timeline();
     hd_.reset();
+    oars_ = BoatOars{};
     hd_last_uploads_ = 0;
     hd_transfer_.Reset();
     hd_constants_.Reset();
     hd_add_.Reset();
+    ball_tile_ = {};
+    ball_vs_.Reset();
+    ball_placements_.Reset();
     art_.release();
     wake_.reset();
     resources_.raster.Reset();
@@ -299,6 +343,13 @@ int SceneCompositor::region_pixel(const scene_record *record, unsigned region, i
         return 1;
     }
     if (region == REGION_MID) {
+        if (record->fire_valid) {
+            return record->pixels[SCENE_NO_FIRE][p] != record->pixels[SCENE_A1][p];
+        }
+        if (record->balls_valid) {
+            return record->ball_mid_mask[p] ||
+                   record->pixels[SCENE_NO_BALLS][p] != record->pixels[SCENE_A1][p];
+        }
         return record->pixels[SCENE_A][p] != record->pixels[SCENE_A1][p];
     }
     if (region == REGION_TOP) {
@@ -372,6 +423,11 @@ int SceneCompositor::build_region(ID3D11Device *device, SceneEntry *entry, const
     }
     RECT bounds = bounds_[index];
     unsigned layer = source_layer(index);
+    unsigned mid_layer =
+        record->fire_valid ? SCENE_NO_FIRE : (record->balls_valid ? SCENE_NO_BALLS : SCENE_A);
+    if (index == REGION_MID) {
+        layer = mid_layer;
+    }
     if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) {
         return 1;
     }
@@ -381,9 +437,7 @@ int SceneCompositor::build_region(ID3D11Device *device, SceneEntry *entry, const
         for (int x = 0; x < width; ++x) {
             int p = (y + bounds.top) * SCENE_WIDTH + x + bounds.left;
             unsigned pixel_layer =
-                index == REGION_EDGE
-                    ? (record->pixels[SCENE_A][p] != record->pixels[SCENE_A1][p] ? SCENE_A : SCENE_A0)
-                    : layer;
+                index == REGION_EDGE ? (region_pixel(record, REGION_MID, p) ? mid_layer : SCENE_A0) : layer;
             pixels_[y * width + x] =
                 region_pixel(record, index, p) ? color(record->pixels[pixel_layer][p]) : 0;
         }
@@ -402,6 +456,39 @@ int SceneCompositor::build_draw(ID3D11Device *device, SceneEntry *entry, const s
         pixels_[p] = draw->pixels[p] == draw->key ? 0 : color(draw->pixels[p]);
     }
     return upload_pixels(device, &entry->draws[index], draw->box);
+}
+
+int SceneCompositor::build_effects(ID3D11Device *device, SceneEntry *entry, const scene_record *record)
+{
+    entry->effect_count = 0;
+    if (!record->fire_valid) {
+        return 1;
+    }
+    if (record->effect_count > SCENE_EFFECTS) {
+        return 0;
+    }
+    for (unsigned i = 0; i < record->effect_count; ++i) {
+        const scene_effect *effect = &record->effects[i];
+        const scene_draw *draw = &effect->draw;
+        if ((effect->ship >= record->count && effect->ship != SCENE_SHIPS) ||
+            (effect->ship != SCENE_SHIPS && effect->id != record->ships[effect->ship].id) ||
+            draw->width < 1 || draw->width > SCENE_SPRITE_SIZE || draw->height < 1 ||
+            draw->height > SCENE_SPRITE_SIZE || draw->box.left < 0 || draw->box.top < 0 ||
+            draw->box.right > SCENE_WIDTH || draw->box.bottom > SCENE_HEIGHT ||
+            draw->box.right - draw->box.left != draw->width ||
+            draw->box.bottom - draw->box.top != draw->height) {
+            return 0;
+        }
+        entry->effect_ship[i] = effect->ship;
+        for (int p = 0; p < draw->width * draw->height; ++p) {
+            pixels_[p] = draw->pixels[p] == draw->key ? 0 : color(draw->pixels[p]);
+        }
+        if (!upload_pixels(device, &entry->effects[i], draw->box)) {
+            return 0;
+        }
+        ++entry->effect_count;
+    }
+    return 1;
 }
 
 void SceneCompositor::initialize_hd(ID3D11Device *device, ID3D11DeviceContext *context)
@@ -538,7 +625,7 @@ bool SceneCompositor::draw_hd(ID3D11DeviceContext *context, const SceneEntry *en
     const hd_pass &pass = entry->hd_passes[index];
     context->PSSetShader(hd_transfer_.Get(), nullptr, 0);
     context->PSSetConstantBuffers(0, 1, hd_constants_.GetAddressOf());
-    unsigned constants[4] = {pass.key, 0, 0, 0};
+    unsigned constants[4] = {pass.key, pause_drawing_ ? 1u : 0u, width, height};
     context->UpdateSubresource(hd_constants_.Get(), 0, nullptr, constants, 0, 0);
     context->OMSetBlendState(pass.blend ? hd_add_.Get() : resources_.blend.Get(), nullptr, UINT32_MAX);
     FLOAT placement[4] = {static_cast<FLOAT>((target.box.left + dx) / SCENE_WIDTH),
@@ -614,6 +701,7 @@ void SceneCompositor::update(ID3D11Device *device, ID3D11DeviceContext *context,
     }
     if (epoch_ != epoch) {
         reset_timeline();
+        timeline_.reset();
         epoch_ = epoch;
     }
     check_stall();
@@ -621,6 +709,9 @@ void SceneCompositor::update(ID3D11Device *device, ID3D11DeviceContext *context,
         if (queue_.input_->epoch != epoch) {
             continue;
         }
+
+        /* Its plain capture may be on screen even if the record is not used. */
+        timeline_.record(queue_.input_->serial, queue_.input_->step);
         if (!queue_.input_->valid) {
             reset_timeline();
             continue;
@@ -628,6 +719,8 @@ void SceneCompositor::update(ID3D11Device *device, ID3D11DeviceContext *context,
         if (!resources_.vs) {
             continue;
         }
+
+        check_gap((double)queue_.input_->qpc);
         if (count_) {
             SceneEntry *last = &resources_.entries[count_ - 1];
             if (queue_.input_->step <= last->step || (double)queue_.input_->qpc <= last->qpc) {
@@ -652,6 +745,10 @@ void SceneCompositor::update(ID3D11Device *device, ID3D11DeviceContext *context,
         out->view = queue_.input_->view;
         out->qpc = (double)queue_.input_->qpc;
         memcpy(out->ships, queue_.input_->ships, sizeof(out->ships));
+        out->balls_valid = queue_.input_->balls_valid;
+        out->ball_count = queue_.input_->ball_count;
+        out->ball_offset = queue_.input_->ball_offset;
+        memcpy(out->balls, queue_.input_->balls, sizeof(out->balls));
         if (wake_) {
             if (!out->wake_bottom) {
                 out->wake_bottom.reset(new (std::nothrow) WORD[SCENE_PIXELS]);
@@ -685,6 +782,9 @@ void SceneCompositor::update(ID3D11Device *device, ID3D11DeviceContext *context,
             ok = build_draw(device, out, queue_.input_, i);
         }
         if (ok) {
+            ok = build_effects(device, out, queue_.input_);
+        }
+        if (ok) {
             build_hd(device, context, out, queue_.input_, width, height);
         }
         if (!ok) {
@@ -714,10 +814,10 @@ void SceneCompositor::update(ID3D11Device *device, ID3D11DeviceContext *context,
     check_stall();
 }
 
-const scene_ship *SceneCompositor::find_ship(const SceneEntry *entry, uintptr_t ptr)
+const scene_ship *SceneCompositor::find_ship(const SceneEntry *entry, uintptr_t ptr, unsigned id)
 {
     for (unsigned i = 0; i < entry->count; ++i) {
-        if (entry->ships[i].ptr == ptr) {
+        if (entry->ships[i].ptr == ptr && (id == 0xffff || entry->ships[i].id == id)) {
             return &entry->ships[i];
         }
     }
@@ -750,7 +850,7 @@ int SceneCompositor::classify(const SceneEntry *before, const SceneEntry *entry,
     double nearest = 1e30;
     for (unsigned i = 0; i < entry->count; ++i) {
         const scene_ship *ship = &entry->ships[i];
-        const scene_ship *old = find_ship(before, ship->ptr);
+        const scene_ship *old = find_ship(before, ship->ptr, ship->id);
         if (!old || (entry->follow != 0xffff && entry->follow != ship->id) ||
             ship->point.x - entry->camera.x != old->point.x - before->camera.x ||
             ship->point.y - entry->camera.y != old->point.y - before->camera.y) {
@@ -872,7 +972,7 @@ void SceneCompositor::observe_motion(const SceneEntry *before, const SceneEntry 
     }
     for (unsigned i = 0; i < entry->count; ++i) {
         const scene_ship *ship = &entry->ships[i];
-        const scene_ship *old = find_ship(before, ship->ptr);
+        const scene_ship *old = find_ship(before, ship->ptr, ship->id);
         if (motion_ && old) {
             for (unsigned j = 0; j < SCENE_SHIPS; ++j) {
                 if (last_ptr_[j] != ship->ptr) {
@@ -936,6 +1036,211 @@ void SceneCompositor::draw_base(ID3D11DeviceContext *context, const SceneEntry *
     context->OMSetBlendState(resources_.blend.Get(), NULL, 0xffffffff);
 }
 
+int SceneCompositor::prepare_ball_tile(ID3D11DeviceContext *context)
+{
+    if (ball_tile_.view && ball_vs_ && ball_placements_) {
+        return 1;
+    }
+
+    ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = BALL_ATLAS;
+    desc.Height = BALL_ATLAS;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    HRESULT hr = device->CreateTexture2D(&desc, nullptr, ball_tile_.texture.ReleaseAndGetAddressOf());
+    if (SUCCEEDED(hr)) {
+        hr = device->CreateShaderResourceView(ball_tile_.texture.Get(), nullptr,
+                                              ball_tile_.view.ReleaseAndGetAddressOf());
+    }
+
+    if (SUCCEEDED(hr)) {
+        hr = device->CreateVertexShader(tow_ball_vs, sizeof(tow_ball_vs), nullptr,
+                                        ball_vs_.ReleaseAndGetAddressOf());
+    }
+
+    D3D11_BUFFER_DESC buffer = {};
+    buffer.ByteWidth = sizeof(ball_rects_);
+    buffer.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    if (SUCCEEDED(hr)) {
+        hr = device->CreateBuffer(&buffer, nullptr, ball_placements_.ReleaseAndGetAddressOf());
+    }
+
+    return SUCCEEDED(hr);
+}
+
+void SceneCompositor::append_ball(const scene_ball *ball, double x, double y, const SceneEntry *entry,
+                                  const double *shift)
+{
+    int head_x = (int)round(x) - entry->ball_offset.x;
+    int head_y = (int)round(y) - entry->ball_offset.y;
+    double left = x - entry->ball_offset.x + shift[0] - BALL_TRAIL;
+    double top = y - entry->ball_offset.y + shift[1] - BALL_TRAIL;
+
+    /* Cull the full transformed tile; the scissor clips its individual pixels. */
+    if (left + BALL_TILE <= entry->view.left || left >= entry->view.right ||
+        top + BALL_TILE <= entry->view.top || top >= entry->view.bottom) {
+        return;
+    }
+
+    int px[BALL_TRAIL];
+    int py[BALL_TRAIL];
+    uint16_t colors[BALL_TRAIL];
+    unsigned count = ball_trail(ball, x, y, entry->ball_offset.x, entry->ball_offset.y, px, py, colors);
+    if (!count) {
+        return;
+    }
+
+    unsigned tile = ball_batch_count_;
+    unsigned tile_x = (tile % BALL_ATLAS_SIDE) * BALL_TILE;
+    unsigned tile_y = (tile / BALL_ATLAS_SIDE) * BALL_TILE;
+    for (unsigned row = 0; row < BALL_TILE; ++row) {
+        memset(ball_pixels_ + (tile_y + row) * BALL_ATLAS + tile_x, 0, BALL_TILE * sizeof(DWORD));
+    }
+
+    for (unsigned i = 0; i < count; ++i) {
+        int tx = px[i] - head_x + BALL_TRAIL;
+        int ty = py[i] - head_y + BALL_TRAIL;
+        ball_pixels_[(tile_y + ty) * BALL_ATLAS + tile_x + tx] = color(colors[i]);
+    }
+
+    ball_rects_[tile][0] = (FLOAT)(left / SCENE_WIDTH);
+    ball_rects_[tile][1] = (FLOAT)(top / SCENE_HEIGHT);
+    ball_rects_[tile][2] = (FLOAT)BALL_TILE / SCENE_WIDTH;
+    ball_rects_[tile][3] = (FLOAT)BALL_TILE / SCENE_HEIGHT;
+    ++ball_batch_count_;
+    ++balls_drawn_;
+}
+
+void SceneCompositor::flush_balls(ID3D11DeviceContext *context, const SceneEntry *entry, UINT width,
+                                  UINT height)
+{
+    if (!ball_batch_count_) {
+        return;
+    }
+
+    /* One atlas upload and one instanced draw, preserving per-ball fractions. */
+    ID3D11ShaderResourceView *empty = nullptr;
+    context->PSSetShaderResources(0, 1, &empty);
+    unsigned rows = (ball_batch_count_ + BALL_ATLAS_SIDE - 1) / BALL_ATLAS_SIDE * BALL_TILE;
+    unsigned columns = min(ball_batch_count_, BALL_ATLAS_SIDE) * BALL_TILE;
+    D3D11_BOX box = {0, 0, 0, columns, rows, 1};
+    context->UpdateSubresource(ball_tile_.texture.Get(), 0, &box, ball_pixels_, BALL_ATLAS * 4, 0);
+    context->UpdateSubresource(ball_placements_.Get(), 0, nullptr, ball_rects_, 0, 0);
+    ++uploads_;
+    upload_bytes_ += (unsigned long long)rows * columns * 4 + sizeof(ball_rects_);
+
+    RECT clip = entry->view;
+    RECT physical = {(LONG)floor((double)clip.left * width / SCENE_WIDTH + .5),
+                     (LONG)floor((double)clip.top * height / SCENE_HEIGHT + .5),
+                     (LONG)floor((double)clip.right * width / SCENE_WIDTH + .5),
+                     (LONG)floor((double)clip.bottom * height / SCENE_HEIGHT + .5)};
+    context->RSSetScissorRects(1, &physical);
+    context->VSSetShader(ball_vs_.Get(), nullptr, 0);
+    context->VSSetConstantBuffers(0, 1, ball_placements_.GetAddressOf());
+    context->PSSetShaderResources(0, 1, ball_tile_.view.GetAddressOf());
+    context->DrawInstanced(4, ball_batch_count_, 0, 0);
+    ++draws_;
+
+    context->PSSetShaderResources(0, 1, &empty);
+    context->VSSetShader(resources_.vs.Get(), nullptr, 0);
+    context->VSSetConstantBuffers(0, 1, resources_.placement.GetAddressOf());
+}
+
+void SceneCompositor::draw_balls(ID3D11DeviceContext *context, const SceneEntry *before,
+                                 const SceneEntry *entry, int reason, double alpha, const double *shift,
+                                 UINT width, UINT height)
+{
+    if (!entry->balls_valid) {
+        ++balls_fallback_;
+        return;
+    }
+
+    ball_batch_count_ = 0;
+
+    /* A pair is usable only if both endpoints excluded original ball pixels.
+     * At births wait for the confirmed step; at ends hold the last known point
+     * until that boundary. Never invent a position beyond a hit or missing step. */
+    if (reason || !before || !before->balls_valid || alpha >= 1) {
+        for (unsigned i = 0; i < entry->ball_count; ++i) {
+            const scene_ball *ball = &entry->balls[i];
+            append_ball(ball, ball->x, ball->y, entry, shift);
+        }
+
+        flush_balls(context, entry, width, height);
+        return;
+    }
+
+    ball_lookup current;
+    ball_index(&current, entry->balls, entry->ball_count);
+
+    for (unsigned i = 0; i < before->ball_count; ++i) {
+        const scene_ball *old = &before->balls[i];
+        const scene_ball *ball = ball_lookup_find(&current, entry->balls, old);
+        double x = old->x;
+        double y = old->y;
+        if (ball && fabs(ball->x - old->x - old->vx) < 1 && fabs(ball->y - old->y - old->vy) < 1 &&
+            ball->life < old->life) {
+            x += alpha * (ball->x - old->x);
+            y += alpha * (ball->y - old->y);
+        }
+
+        append_ball(old, x, y, entry, shift);
+    }
+
+    flush_balls(context, entry, width, height);
+}
+
+void SceneCompositor::draw_oars(ID3D11DeviceContext *context, const SceneEntry *entry,
+                                const SceneEntry *before, unsigned ship_index, double dx, double dy,
+                                double alpha, int reason, UINT width, UINT height)
+{
+    const boat_oars_config config = boat_oars_settings();
+    const scene_ship &ship = entry->ships[ship_index];
+    if (!config.enabled || (ship.type != 9 && ship.type != 10) || !ship.heading_valid) {
+        return;
+    }
+    ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!oars_.init(device.Get())) {
+        return;
+    }
+    const scene_ship *old = before ? find_ship(before, ship.ptr, ship.id) : nullptr;
+    double x = ship.x;
+    double y = ship.y;
+    if (!reason && old) {
+        x = old->x + (ship.x - old->x) * alpha;
+        y = old->y + (ship.y - old->y) * alpha;
+    }
+    /* Use pose+0x18, never course/velocity (boats can travel backwards).
+     * HD ships hold current hull rotation, so even a shortest-arc angular lerp here
+     * would detach the oars between steps and at the 359/0 boundary. */
+    double phase = oars_.phase(ship, x, y, timeline_.time() / frequency_, reason != 0, config);
+    double ax = ship.point.x - entry->camera.x + entry->view.left + dx;
+    double ay = ship.point.y - entry->camera.y + entry->view.top + dy;
+    OarVertex vertices[OAR_VERTEX_LIMIT];
+    unsigned count = boat_oar_vertices(vertices, config, ship.heading, phase, ax, ay);
+    RECT clip = {(LONG)floor(entry->view.left * (double)width / SCENE_WIDTH + .5),
+                 (LONG)floor(entry->view.top * (double)height / SCENE_HEIGHT + .5),
+                 (LONG)floor(entry->view.right * (double)width / SCENE_WIDTH + .5),
+                 (LONG)floor(entry->view.bottom * (double)height / SCENE_HEIGHT + .5)};
+    context->RSSetScissorRects(1, &clip);
+    if (oars_.draw(context, vertices, count)) {
+        ++draws_;
+        ++uploads_;
+        upload_bytes_ += count * sizeof(OarVertex);
+    }
+    /* Return the shared compositor pipeline to its sprite state. */
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    context->VSSetShader(resources_.vs.Get(), nullptr, 0);
+    context->VSSetConstantBuffers(0, 1, resources_.placement.GetAddressOf());
+    context->PSSetShader(resources_.layer_ps.Get(), nullptr, 0);
+}
+
 int SceneCompositor::draw(ID3D11DeviceContext *context, UINT width, UINT height, LONG epoch)
 {
     if (!count_ || !valid_ || epoch != epoch_) {
@@ -943,25 +1248,14 @@ int SceneCompositor::draw(ID3D11DeviceContext *context, UINT width, UINT height,
         return 0;
     }
     double start = ticks();
-    double elapsed = now_ ? max(0, start - now_) : 0;
-    now_ = start;
-    if (!time_) {
-        time_ = resources_.entries[0].qpc;
-    }
     double interval = interval_ ? interval_ : frequency_ * .078;
-    double target = start - interval;
-    double rate = clamp(1 + (target - time_) / (4 * interval), .75, 1.25);
-    time_ = max(time_, min(resources_.entries[count_ - 1].qpc, time_ + elapsed * rate));
-    while (count_ > 2 && resources_.entries[1].qpc <= time_) {
+    timeline_.advance(resources_.entries, count_, start, interval);
+    double display = timeline_.time();
+    while (count_ > 2 && resources_.entries[1].qpc <= display) {
         discard_first();
     }
-    unsigned current = count_ - 1;
-    for (unsigned i = 1; i < count_; ++i) {
-        if (resources_.entries[i].qpc >= time_) {
-            current = i;
-            break;
-        }
-    }
+
+    unsigned current = SceneTimeline::pair(resources_.entries, count_, display);
     const SceneEntry *entry = &resources_.entries[current];
     if (!hd_add_) {
         for (unsigned i = 0; i < entry->draw_count; ++i) {
@@ -989,7 +1283,7 @@ int SceneCompositor::draw(ID3D11DeviceContext *context, UINT width, UINT height,
     int reason = classify(before, entry, cam0, cam1);
     /* classify returns SNAP_PREV for null before; the analyzer loses that relation. */
     // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
-    double alpha = reason ? 1 : clamp((time_ - before->qpc) / (entry->qpc - before->qpc), 0, 1);
+    double alpha = reason ? 1 : clamp((display - before->qpc) / (entry->qpc - before->qpc), 0, 1);
     double camera[2] = {cam0[0] + (cam1[0] - cam0[0]) * alpha, cam0[1] + (cam1[1] - cam0[1]) * alpha};
     double shift[2] = {entry->camera.x - camera[0], entry->camera.y - camera[1]};
     ++frames_;
@@ -1001,6 +1295,10 @@ int SceneCompositor::draw(ID3D11DeviceContext *context, UINT width, UINT height,
         camera[1] = entry->camera.y;
         motion_ = 0;
     }
+    if (entry->balls_valid && !prepare_ball_tile(context)) {
+        ++balls_fallback_;
+        return 0;
+    }
     context->VSSetShader(resources_.vs.Get(), NULL, 0);
     context->VSSetConstantBuffers(0, 1, resources_.placement.GetAddressOf());
     context->OMSetBlendState(resources_.blend.Get(), NULL, 0xffffffff);
@@ -1008,19 +1306,23 @@ int SceneCompositor::draw(ID3D11DeviceContext *context, UINT width, UINT height,
     wake_ready_ = false;
     if (wake_ && entry->wake_bottom) {
         WakePose poses[SCENE_SHIPS] = {};
+        unsigned pose_count = 0;
         for (unsigned i = 0; i < entry->count; ++i) {
             const scene_ship &ship = entry->ships[i];
-            const scene_ship *old = before ? find_ship(before, ship.ptr) : nullptr;
+            const scene_ship *old = before ? find_ship(before, ship.ptr, ship.id) : nullptr;
             double dx = 0;
             double dy = 0;
             if (!reason && old && ship.ptr != follow_) {
                 dx = old->x + (ship.x - old->x) * alpha - camera[0] - (ship.point.x - entry->camera.x);
                 dy = old->y + (ship.y - old->y) * alpha - camera[1] - (ship.point.y - entry->camera.y);
             }
-            poses[i] = WakeLayer::placed_pose(ship, dx, dy, entry->camera, camera);
+            if (wake_settings().boats || (ship.type != 9 && ship.type != 10)) {
+                poses[pose_count++] = WakeLayer::placed_pose(ship, dx, dy, entry->camera, camera);
+            }
         }
-        wake_ready_ = wake_->update(context, entry->view, entry->camera, camera, poses, entry->count,
-                                    entry->follow, entry->wake_bottom.get(), time_ / frequency_, reason != 0);
+        wake_ready_ =
+            wake_->update(context, entry->view, entry->camera, camera, poses, pose_count, entry->follow,
+                          entry->wake_bottom.get(), display / frequency_, reason != 0);
     }
     draw_base(context, entry, reason ? entry : before, camera, shift, width, height);
     double positions[SCENE_SHIPS][2] = {{0}};
@@ -1033,11 +1335,19 @@ int SceneCompositor::draw(ID3D11DeviceContext *context, UINT width, UINT height,
     double offsets[SCENE_SHIPS][2] = {};
     for (unsigned pass = 0; pass < 2; ++pass) {
         if (pass) {
+            draw_balls(context, before, entry, reason, alpha, shift, width, height);
             draw_region(context, entry, REGION_MID, shift[0], shift[1], entry->view, width, height);
+            /* Pass 0 computed the same offsets used by hull/HD transfers. */
+            for (unsigned i = 0; i < entry->effect_count; ++i) {
+                unsigned ship = entry->effect_ship[i];
+                double dx = ship == SCENE_SHIPS ? shift[0] : offsets[ship][0];
+                double dy = ship == SCENE_SHIPS ? shift[1] : offsets[ship][1];
+                draw_sprite(context, &entry->effects[i], dx, dy, entry->view, width, height);
+            }
         }
         for (unsigned i = 0; i < entry->count; ++i) {
             const scene_ship *ship = &entry->ships[i];
-            const scene_ship *old = before ? find_ship(before, ship->ptr) : NULL;
+            const scene_ship *old = before ? find_ship(before, ship->ptr, ship->id) : NULL;
             double dx = 0;
             double dy = 0;
             if (!reason && old && ship->ptr != follow_) {
@@ -1073,6 +1383,20 @@ int SceneCompositor::draw(ID3D11DeviceContext *context, UINT width, UINT height,
                     draw_sprite(context, &entry->draws[i], dx, dy, entry->view, width, height);
                     context->OMSetBlendState(resources_.blend.Get(), nullptr, UINT32_MAX);
                 }
+                if (!pass && ship < entry->count) {
+                    /* A clipped boat may have several transfers; add the oars once,
+                     * immediately after its last hull transfer in painter order. */
+                    bool last = true;
+                    for (unsigned next = i + 1; next < entry->draw_count; ++next) {
+                        if (entry->draw_pass[next] == pass && entry->draw_ship[next] == ship) {
+                            last = false;
+                            break;
+                        }
+                    }
+                    if (last) {
+                        draw_oars(context, entry, before, ship, dx, dy, alpha, reason, width, height);
+                    }
+                }
             }
         }
     }
@@ -1089,6 +1413,39 @@ int SceneCompositor::draw(ID3D11DeviceContext *context, UINT width, UINT height,
     return 1;
 }
 
+/* Compare with this record, never with the previous displayed/interpolated frame.
+ * No world effects are advanced while the plain path owns the paused picture. */
+void SceneCompositor::draw_pause(ID3D11DeviceContext *context, ID3D11ShaderResourceView *plain, UINT width,
+                                 UINT height, LONG epoch)
+{
+    if (!initialized_ || !stalled_ || epoch != epoch_ || !ship_hd_render_scale() ||
+        !FrameQueue::mission_supported() || !plain || !hd_transfer_ || !hd_constants_ || !hd_add_) {
+        return;
+    }
+    const SceneEntry *entry = count_ ? &resources_.entries[count_ - 1] : &pause_entry_;
+    if (!entry->regions[REGION_FINAL].view) {
+        return;
+    }
+    ID3D11ShaderResourceView *views[] = {plain, entry->regions[REGION_FINAL].view.Get()};
+    context->PSSetShaderResources(1, 2, views);
+    context->VSSetShader(resources_.vs.Get(), nullptr, 0);
+    context->VSSetConstantBuffers(0, 1, resources_.placement.GetAddressOf());
+    context->RSSetState(resources_.raster.Get());
+    pause_drawing_ = true;
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        for (unsigned i = 0; i < entry->draw_count; ++i) {
+            if (entry->draw_pass[i] == pass) {
+                draw_hd(context, entry, i, 0, 0, width, height);
+            }
+        }
+    }
+    pause_drawing_ = false;
+    ID3D11ShaderResourceView *empty[3] = {};
+    context->PSSetShaderResources(0, 3, empty);
+    context->OMSetBlendState(nullptr, nullptr, UINT32_MAX);
+    context->RSSetState(nullptr);
+}
+
 int SceneCompositor::active(void)
 {
     return valid_;
@@ -1103,6 +1460,9 @@ void SceneCompositor::counters(unsigned *draws, unsigned *uploads, unsigned long
 
 void SceneCompositor::log(void)
 {
+    diag_log("smooth_balls: drawn=%u fallback_frames=%u", balls_drawn_, balls_fallback_);
+    balls_drawn_ = 0;
+    balls_fallback_ = 0;
     if (ship_hd_render_scale()) {
         unsigned textures = hd_ ? hd_->uploads() : 0;
         diag_log("hd_ships: ships_hd=%u ships_fallback=%u triangles=%u textures=%u ms=%.3f", ships_hd_,
@@ -1119,6 +1479,11 @@ void SceneCompositor::log(void)
     diag_log("scene: stall_plain_interval=%u stall_max_ms=%.1f", stall_plain_, stall_max_ms_);
     stall_plain_ = 0;
     stall_max_ms_ = 0;
+    double rebase_max = 0;
+    unsigned rebases = timeline_.take_rebases(&rebase_max);
+    diag_log("scene: timeline_rebases_interval=%u rebase_max_ms=%.1f gap_resets_interval=%u", rebases,
+             frequency_ ? rebase_max * 1000.0 / frequency_ : 0, gap_resets_);
+    gap_resets_ = 0;
     diag_log("scene: recovery_held_records=%u recovery_complete_records=%u recovery_required=%u",
              held_records_, complete_records_, SCENE_RECOVERY_RECORDS);
     diag_log("scene: clouds_drawn=%u clouds_interpolated=%u clouds_snapped=%u cloud_art_loaded=%u "

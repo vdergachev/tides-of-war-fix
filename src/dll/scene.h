@@ -5,20 +5,33 @@
 #include <stdint.h>
 #include "diag.h"
 #include "ship_live.h"
+#include "ball_geometry.h"
 
 #define SCENE_WIDTH  640
 #define SCENE_HEIGHT 480
 #define SCENE_PIXELS (SCENE_WIDTH * SCENE_HEIGHT)
-#define SCENE_SHIPS  8
+/* Shared moving-object slots: ships plus Launch/Canoe boats. */
+#define SCENE_SHIPS  16
 #define SCENE_RING   4
 #define SCENE_CLOUDS 5
-/* One transfer per ship per pass; static objects 9/10 add one each.
- * Keep capacity at 32; overflow uses the plain frame. */
-#define SCENE_DRAWS         (SCENE_SHIPS * 4)
+/* Keep the existing transfer/pixel budget; overflow uses the plain frame. */
+#define SCENE_DRAWS         32
 #define SCENE_SPRITE_SIZE   144
 #define SCENE_SPRITE_PIXELS (SCENE_SPRITE_SIZE * SCENE_SPRITE_SIZE)
+#define SCENE_EFFECTS       128
 
-enum { SCENE_A0, SCENE_A1, SCENE_A, SCENE_B, SCENE_C, SCENE_D, SCENE_E, SCENE_LAYERS };
+enum {
+    SCENE_A0,
+    SCENE_A1,
+    SCENE_A,
+    SCENE_B,
+    SCENE_C,
+    SCENE_D,
+    SCENE_E,
+    SCENE_NO_BALLS,
+    SCENE_NO_FIRE,
+    SCENE_LAYERS
+};
 
 typedef struct {
     unsigned ticks;
@@ -39,6 +52,9 @@ typedef struct {
     double x;
     double y;
     double course;
+    unsigned type;
+    double heading;
+    int heading_valid;
     POINT point;
     RECT box;
     double wake_stern;
@@ -59,8 +75,21 @@ typedef struct {
     WORD pixels[SCENE_SPRITE_PIXELS];
 } scene_draw;
 
+/* Ordered MID transfers, including stationary smoke to preserve overlap. */
+typedef struct {
+    unsigned ship;
+    unsigned id;
+    uintptr_t source;
+    unsigned frame;
+    RECT source_rect;
+    RECT relative;
+    scene_draw draw;
+} scene_effect;
+
 typedef struct {
     LONG epoch;
+    /* Plain capture serial published with this record (shown-step mapping). */
+    LONG serial;
     unsigned step;
     unsigned count;
     unsigned follow;
@@ -69,12 +98,24 @@ typedef struct {
     POINT camera;
     RECT view;
     LONGLONG qpc;
+    unsigned ball_count;
+    unsigned ball_births;
+    unsigned ball_ends;
+    unsigned ball_event_count;
+    int balls_valid;
+    POINT ball_offset;
+    scene_ball balls[BALL_LIMIT];
+    scene_ball_event ball_events[BALL_LIMIT * 2];
     scene_ship ships[SCENE_SHIPS];
     unsigned cloud_flags;
     scene_cloud clouds[SCENE_CLOUDS];
     unsigned draw_count;
     scene_draw draws[SCENE_DRAWS];
+    int fire_valid;
+    unsigned effect_count;
+    scene_effect effects[SCENE_EFFECTS];
     hd_live_record *hd;
+    BYTE ball_mid_mask[SCENE_PIXELS];
     WORD pixels[SCENE_LAYERS][SCENE_PIXELS];
 } scene_record;
 

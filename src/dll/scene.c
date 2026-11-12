@@ -10,6 +10,7 @@
 #include "log.h"
 #include "diag.h"
 #include "ship_capture.h"
+#include "smooth_balls.h"
 
 /* Scene capture for smoothing, supported image only. All offsets are observation-only. */
 #define CLOUD_CALL_ADDRESS     0x43ae82
@@ -239,6 +240,9 @@ static void __stdcall observe_enter(const DWORD *saved)
         if (!copy_layer(mode ? SCENE_A0 : SCENE_A)) {
             g_work->valid = 0;
         }
+        if (!mode) {
+            smooth_balls_finish();
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         g_work->valid = 0;
     }
@@ -258,6 +262,9 @@ static void __stdcall observe_leave(const DWORD *saved)
         g_in_pass = 0;
         if (g_open && !copy_layer(g_mode ? SCENE_A1 : SCENE_B)) {
             g_work->valid = 0;
+        }
+        if (g_open && g_mode) {
+            smooth_balls_begin(g_work, g_frame);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         g_work->valid = 0;
@@ -289,12 +296,8 @@ static void __stdcall observe_ship(const DWORD *saved)
             __leave;
         }
         BYTE *ship = (*(BYTE ***)(table + TABLE_ARRAY))[id];
-        unsigned type = *(WORD *)(ship + SHIP_TYPE);
-        if (type == 9 || type == 10) {
-            /* Static objects precede ships in the hull pass. Move with camera. */
-            g_current = SCENE_SHIPS;
-            __leave;
-        }
+        /* Types 9/10 are Launch/Canoe, drawn first in the hull pass.
+         * They need their own pose and transfer owner, just like larger ships. */
         unsigned index = 0;
         while (index < g_work->count && g_work->ships[index].id != id) {
             ++index;
@@ -313,6 +316,12 @@ static void __stdcall observe_ship(const DWORD *saved)
         out->x = pose[0];
         out->y = pose[1];
         out->course = pose[2];
+        out->type = *(unsigned *)(ship + SHIP_TYPE);
+        out->heading_valid = 0;
+        if (out->type == 9 || out->type == 10) {
+            out->heading = pose[3];
+            out->heading_valid = isfinite(out->heading) && fabs(out->heading) < 1e8;
+        }
         out->point = *(POINT *)(ship + SHIP_POINT);
         SetRectEmpty(&out->box);
         g_current = (int)index;
@@ -839,6 +848,7 @@ int scene_init(SRWLOCK *lock)
         return 0;
     }
     g_lock = lock;
+    smooth_balls_install();
     log_line("scene: capture ready ring=%d", SCENE_RING);
     return 1;
 }
@@ -899,6 +909,8 @@ void scene_present(HDC source, LONG epoch, LONG serial)
         g_work->valid = 0;
     }
     g_work->valid = g_work->valid && (g_work->layers & ((1u << SCENE_D) - 1)) == (1u << SCENE_D) - 1;
+    /* Also disarm ball observers when an earlier guarded capture failed. */
+    smooth_balls_finish();
     if (!g_work->valid) {
         ++g_failures;
     }
@@ -907,6 +919,7 @@ void scene_present(HDC source, LONG epoch, LONG serial)
     g_last_step = g_step;
     g_had_record = 1;
     g_work->epoch = epoch;
+    g_work->serial = serial;
     AcquireSRWLockExclusive(g_lock);
     if (g_size == SCENE_RING) {
         g_head = (g_head + 1) % SCENE_RING;
@@ -958,6 +971,7 @@ int scene_take(scene_record **record)
 
 void scene_capture_log(void)
 {
+    smooth_balls_log();
     if (!g_lock) {
         return;
     }
