@@ -73,6 +73,8 @@ For reference, the main keys (`1` = on, `0` = off):
 | `[smooth_fire]` | `enabled` | `1` | fire and damage smoke move smoothly with their ship |
 | `[boat_oars]` | `enabled` | `1` | animated oars on boats |
 | `[wake]` | `boats` | `0` | wake, bubbles and ripples around boats |
+| `[smooth_radar]` | `enabled` | `1` | smooth minimap: terrain, ships and ports move smoothly |
+| `[smooth_radar]` | `pointers` | `1` | smooth heading and wind pointers on the minimap |
 
 A log is written to `tow_fix.log` next to `TOW.exe`; please attach it to bug reports.
 

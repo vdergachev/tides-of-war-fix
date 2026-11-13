@@ -18,13 +18,14 @@
 #include "d3d_fix.h"
 #include "ship_capture.h"
 #include "smooth_balls.h"
+#include "smooth_radar.h"
 #include "smooth_fire.h"
 #include "scale.h"
 #include "display.h"
 #include "d3d11_out.h"
 #include "../common/sha256.h"
 
-#define TOW_FIX_VERSION "0.18.0"
+#define TOW_FIX_VERSION "0.19.0"
 
 /* Supported game image and CRT entry point, before any game initialization. */
 #define GAME_IMAGE_BASE    0x400000
@@ -138,6 +139,7 @@ static int read_settings(const char *dir, tow_settings *settings)
     wake_configure(path);
     ship_capture_configure(path);
     smooth_balls_configure(path);
+    smooth_radar_configure(path);
     smooth_fire_configure(path);
     cargo_pause_configure(path);
     settings->gun_smoke = (int)GetPrivateProfileIntA("gun_smoke", "every_shot", 0, path);

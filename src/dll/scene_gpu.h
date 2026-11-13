@@ -48,6 +48,14 @@ struct SceneEntry {
     Texture2D hd_draws[SCENE_DRAWS];
     hd_pass hd_passes[SCENE_DRAWS];
     std::unique_ptr<WORD[]> wake_bottom;
+    std::unique_ptr<radar_capture> radar;
+    unsigned radar_failure;
+    Texture2D radar_terrain;
+    Texture2D radar_compass;
+    Texture2D radar_overlay;
+    Texture2D radar_ui;
+    Texture2D radar_pointers[RADAR_POINTERS];
+    Texture2D radar_markers[RADAR_MARKERS];
 };
 
 enum { SNAP_NONE, SNAP_PREV, SNAP_GAP, SNAP_FOLLOW, SNAP_CHANGE, SNAP_JUMP, SNAP_COUNT };
@@ -62,11 +70,12 @@ struct SceneResources {
     ComPtr<ID3D11PixelShader> base_ps;
     ComPtr<ID3D11PixelShader> layer_ps;
     ComPtr<ID3D11BlendState> blend;
+    ComPtr<ID3D11BlendState> radar_blend;
     ComPtr<ID3D11RasterizerState> raster;
 
     SceneResources() noexcept
         : entries{}, vs(nullptr), placement(nullptr), base_constants(nullptr), base_ps(nullptr),
-          layer_ps(nullptr), blend(nullptr), raster(nullptr)
+          layer_ps(nullptr), blend(nullptr), radar_blend(nullptr), raster(nullptr)
     {
     }
 };
@@ -151,6 +160,12 @@ class SceneCompositor
                         const double *cam0, const double *cam1, double positions[SCENE_SHIPS][2]);
     void draw_base(ID3D11DeviceContext *context, const SceneEntry *entry, const SceneEntry *edge,
                    const double *camera, const double *shift, UINT width, UINT height);
+    void build_radar(ID3D11Device *device, SceneEntry *entry, const radar_capture *capture);
+    bool draw_radar(ID3D11DeviceContext *context, const SceneEntry *before, const SceneEntry *entry,
+                    int reason, double alpha, UINT width, UINT height);
+    unsigned radar_drawn_ = 0;
+    unsigned radar_fallback_ = 0;
+    unsigned radar_reasons_[RADAR_REASON_COUNT] = {};
 
     void initialize_hd(ID3D11Device *device, ID3D11DeviceContext *context);
     bool build_hd_draw(ID3D11DeviceContext *context, SceneEntry *entry, const scene_record *record,

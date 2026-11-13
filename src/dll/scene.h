@@ -6,6 +6,7 @@
 #include "diag.h"
 #include "ship_live.h"
 #include "ball_geometry.h"
+#include "radar_geometry.h"
 
 #define SCENE_WIDTH  640
 #define SCENE_HEIGHT 480
@@ -114,6 +115,7 @@ typedef struct {
     int fire_valid;
     unsigned effect_count;
     scene_effect effects[SCENE_EFFECTS];
+    radar_capture radar;
     hd_live_record *hd;
     BYTE ball_mid_mask[SCENE_PIXELS];
     WORD pixels[SCENE_LAYERS][SCENE_PIXELS];

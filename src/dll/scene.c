@@ -11,6 +11,7 @@
 #include "diag.h"
 #include "ship_capture.h"
 #include "smooth_balls.h"
+#include "smooth_radar.h"
 
 /* Scene capture for smoothing, supported image only. All offsets are observation-only. */
 #define CLOUD_CALL_ADDRESS     0x43ae82
@@ -203,6 +204,7 @@ static void __stdcall observe_enter(const DWORD *saved)
         g_current = -1;
         if (!g_lock || !mission()) {
             g_open = 0;
+            smooth_radar_reset();
             __leave;
         }
         if (mode == 1) {
@@ -228,6 +230,7 @@ static void __stdcall observe_enter(const DWORD *saved)
             RECT v = g_work->view;
             g_work->valid = v.left >= 0 && v.top >= 0 && v.right <= SCENE_WIDTH && v.bottom <= SCENE_HEIGHT &&
                             v.right > v.left + 16 && v.bottom > v.top + 16;
+            smooth_radar_begin(g_work, g_frame);
         }
         if (!g_open || g_frame != (BYTE *)args[0] || (mode != 0 && mode != 1)) {
             g_open = 1;
@@ -849,6 +852,7 @@ int scene_init(SRWLOCK *lock)
     }
     g_lock = lock;
     smooth_balls_install();
+    smooth_radar_install();
     log_line("scene: capture ready ring=%d", SCENE_RING);
     return 1;
 }
@@ -911,6 +915,10 @@ void scene_present(HDC source, LONG epoch, LONG serial)
     g_work->valid = g_work->valid && (g_work->layers & ((1u << SCENE_D) - 1)) == (1u << SCENE_D) - 1;
     /* Also disarm ball observers when an earlier guarded capture failed. */
     smooth_balls_finish();
+    if (!mission()) {
+        smooth_radar_reset();
+    }
+    smooth_radar_finish(epoch);
     if (!g_work->valid) {
         ++g_failures;
     }
@@ -972,6 +980,7 @@ int scene_take(scene_record **record)
 void scene_capture_log(void)
 {
     smooth_balls_log();
+    smooth_radar_log();
     if (!g_lock) {
         return;
     }

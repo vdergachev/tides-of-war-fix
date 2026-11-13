@@ -14,6 +14,7 @@
 #include "d3d11_ps.h"
 #undef tow_d3d11_ps
 #include "diag.h"
+#include "log.h"
 #include "game_speed.h"
 #include <wrl/client.h>
 #include <utility>
@@ -50,6 +51,17 @@ DWORD SceneCompositor::color(WORD value)
 
 void SceneCompositor::release_entry(SceneEntry *entry)
 {
+    entry->radar.reset();
+    entry->radar_terrain = {};
+    entry->radar_compass = {};
+    entry->radar_overlay = {};
+    entry->radar_ui = {};
+    for (auto &pointer : entry->radar_pointers) {
+        pointer = {};
+    }
+    for (auto &marker : entry->radar_markers) {
+        marker = {};
+    }
     for (auto &effect : entry->effects) {
         effect = {};
     }
@@ -163,6 +175,7 @@ void SceneCompositor::release(void)
     wake_.reset();
     resources_.raster.Reset();
     resources_.blend.Reset();
+    resources_.radar_blend.Reset();
     resources_.placement.Reset();
     resources_.vs.Reset();
     resources_.base_constants.Reset();
@@ -216,6 +229,11 @@ int SceneCompositor::init(ID3D11Device *device)
     blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     if (SUCCEEDED(hr)) {
         hr = device->CreateBlendState(&blend, &resources_.blend);
+    }
+    if (SUCCEEDED(hr)) {
+        /* Key pixels preserve the alpha of the complete radar underneath. */
+        blend.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        hr = device->CreateBlendState(&blend, &resources_.radar_blend);
     }
     D3D11_RASTERIZER_DESC raster = {D3D11_FILL_SOLID, D3D11_CULL_NONE};
     raster.FillMode = D3D11_FILL_SOLID;
@@ -678,6 +696,131 @@ int SceneCompositor::upload_pixels(ID3D11Device *device, Texture2D *out, RECT bo
     return SUCCEEDED(hr);
 }
 
+/* Radar failures are local: REGION_FINAL already contains the original radar. */
+void SceneCompositor::build_radar(ID3D11Device *device, SceneEntry *entry, const radar_capture *capture)
+{
+    entry->radar.reset();
+    entry->radar_failure = capture->failure ? capture->failure : RADAR_INCOMPLETE;
+    if (!capture->valid || capture->count > RADAR_MARKERS || capture->history_count > RADAR_MARKERS) {
+        return;
+    }
+    entry->radar_failure = RADAR_GPU;
+    bool ok = true;
+    for (unsigned layer = 0; layer < 4 && ok; ++layer) {
+        unsigned p = 0;
+        int first = layer ? 0 : 1;
+        int last = layer ? RADAR_SIDE : 127;
+        for (int y = first; y < last; ++y) {
+            for (int x = first; x < last; ++x) {
+                unsigned source = y * RADAR_SIDE + x;
+                WORD value = layer == 0   ? capture->terrain[source]
+                             : layer == 1 ? capture->compass[source]
+                             : layer == 2 ? capture->overlay[source]
+                                          : capture->final[source];
+                bool opaque =
+                    layer == 0 || (layer == 1 ? capture->compass_mask[source]
+                                              : capture->overlay_mask[source] &
+                                                    (layer == 2 ? RADAR_FRAME_MASK : RADAR_UI_MASK));
+                pixels_[p++] = opaque ? color(value) : 0;
+            }
+        }
+        Texture2D *target = layer == 0   ? &entry->radar_terrain
+                            : layer == 1 ? &entry->radar_compass
+                            : layer == 2 ? &entry->radar_overlay
+                                         : &entry->radar_ui;
+        *target = {};
+        RECT box = {first, first, last, last};
+        ok = upload_pixels(device, target, box) != 0;
+    }
+    for (unsigned i = 0; i < RADAR_POINTERS && ok; ++i) {
+        const radar_pointer &pointer = capture->pointers[i];
+        entry->radar_pointers[i] = {};
+        if (!pointer.present) {
+            continue;
+        }
+        for (unsigned p = 0; p < RADAR_POINTER_SIDE * RADAR_POINTER_SIDE; ++p) {
+            pixels_[p] = pointer.pixels[p] == 0x07e0 ? 0 : color(pointer.pixels[p]);
+        }
+        ok = upload_pixels(device, &entry->radar_pointers[i], pointer.dest) != 0;
+    }
+    for (unsigned i = 0; i < capture->count && ok; ++i) {
+        const radar_marker &marker = capture->markers[i];
+        for (unsigned p = 0; p < RADAR_ART_SIDE * RADAR_ART_SIDE; ++p) {
+            pixels_[p] = marker.pixels[p] == marker.key ? 0 : color(marker.pixels[p]);
+        }
+        entry->radar_markers[i] = {};
+        ok = upload_pixels(device, &entry->radar_markers[i], marker.dest) != 0;
+    }
+    if (ok) {
+        entry->radar.reset(new (std::nothrow) radar_capture(*capture));
+    }
+}
+
+bool SceneCompositor::draw_radar(ID3D11DeviceContext *context, const SceneEntry *before,
+                                 const SceneEntry *entry, int reason, double alpha, UINT width, UINT height)
+{
+    const radar_capture *old = before ? before->radar.get() : nullptr;
+    const radar_capture *now = entry->radar.get();
+    unsigned failure = RADAR_OK;
+    if (reason) {
+        failure = RADAR_SNAP;
+    } else if (!now || !old) {
+        failure = !now ? entry->radar_failure : before ? before->radar_failure : RADAR_INCOMPLETE;
+        if (!failure || failure >= RADAR_REASON_COUNT) {
+            failure = RADAR_INCOMPLETE;
+        }
+    } else {
+        failure = radar_pair_reason(old, now);
+        if (!failure && !radar_coverage(old, now, alpha)) {
+            failure = RADAR_COVERAGE;
+        }
+    }
+    if (failure) {
+        ++radar_fallback_;
+        ++radar_reasons_[failure];
+        return false;
+    }
+    /* Preflight coverage before the first write. The union of both captures
+     * covers the exact art aperture; no stale marker pixels can show through. */
+    RECT clip = {0, 0, RADAR_SIDE, RADAR_SIDE};
+    double left = old->left + (now->left - old->left) * alpha;
+    double top = old->top + (now->top - old->top) * alpha;
+    context->PSSetShader(resources_.layer_ps.Get(), nullptr, 0);
+    context->OMSetBlendState(resources_.radar_blend.Get(), nullptr, UINT_MAX);
+    draw_sprite(context, &before->radar_terrain, radar_terrain_shift(old->tile.x, left),
+                radar_terrain_shift(old->tile.y, top), clip, width, height);
+    draw_sprite(context, &entry->radar_terrain, radar_terrain_shift(now->tile.x, left),
+                radar_terrain_shift(now->tile.y, top), clip, width, height);
+    draw_sprite(context, &entry->radar_compass, 0, 0, clip, width, height);
+    for (unsigned i = 0; i < now->count; ++i) {
+        double x;
+        double y;
+        radar_marker_position(old, now, i, alpha, &x, &y);
+        draw_sprite(context, &entry->radar_markers[i], x - now->markers[i].dest.left,
+                    y - now->markers[i].dest.top, clip, width, height);
+    }
+    draw_sprite(context, &entry->radar_overlay, 0, 0, clip, width, height);
+    /* Keep even fallback sprites in their original order: frame, wind, heading.
+     * Invalid angles use exactly the old masked pixels and integer destination. */
+    for (unsigned i = 0; i < RADAR_POINTERS; ++i) {
+        const radar_pointer &pointer = now->pointers[i];
+        if (!pointer.present) {
+            continue;
+        }
+        double x = pointer.dest.left;
+        double y = pointer.dest.top;
+        if (pointer.valid) {
+            radar_pointer_position(&old->pointers[i], &pointer, alpha, &x, &y);
+        }
+        draw_sprite(context, &entry->radar_pointers[i], x - pointer.dest.left, y - pointer.dest.top, clip,
+                    width, height);
+    }
+    draw_sprite(context, &entry->radar_ui, 0, 0, clip, width, height);
+    context->OMSetBlendState(resources_.blend.Get(), nullptr, UINT_MAX);
+    ++radar_drawn_;
+    return true;
+}
+
 void SceneCompositor::discard_first(void)
 {
     auto bottom = std::move(resources_.entries[0].wake_bottom);
@@ -786,6 +929,7 @@ void SceneCompositor::update(ID3D11Device *device, ID3D11DeviceContext *context,
         }
         if (ok) {
             build_hd(device, context, out, queue_.input_, width, height);
+            build_radar(device, out, &queue_.input_->radar);
         }
         if (!ok) {
             release_entry(out);
@@ -1402,6 +1546,7 @@ int SceneCompositor::draw(ID3D11DeviceContext *context, UINT width, UINT height,
     }
     draw_clouds(context, before, entry, reason, alpha, shift, width, height);
     draw_region(context, entry, REGION_TOP, 0, 0, entry->view, width, height);
+    draw_radar(context, before, entry, reason, alpha, width, height);
     if (!reason) {
         observe_motion(before, entry, camera, cam0, cam1, positions);
     }
@@ -1460,6 +1605,16 @@ void SceneCompositor::counters(unsigned *draws, unsigned *uploads, unsigned long
 
 void SceneCompositor::log(void)
 {
+    log_line("smooth_radar: drawn=%u fallback_frames=%u snap_teleport=%u coverage=%u identity=%u "
+             "seam=%u incomplete=%u replay=%u gpu=%u viewport=%u art=%u overflow=%u read=%u occluded=%u",
+             radar_drawn_, radar_fallback_, radar_reasons_[RADAR_SNAP], radar_reasons_[RADAR_COVERAGE],
+             radar_reasons_[RADAR_IDENTITY], radar_reasons_[RADAR_SEAM], radar_reasons_[RADAR_INCOMPLETE],
+             radar_reasons_[RADAR_REPLAY], radar_reasons_[RADAR_GPU], radar_reasons_[RADAR_VIEWPORT],
+             radar_reasons_[RADAR_ART], radar_reasons_[RADAR_OVERFLOW], radar_reasons_[RADAR_READ],
+             radar_reasons_[RADAR_OCCLUDED]);
+    memset(radar_reasons_, 0, sizeof(radar_reasons_));
+    radar_drawn_ = 0;
+    radar_fallback_ = 0;
     diag_log("smooth_balls: drawn=%u fallback_frames=%u", balls_drawn_, balls_fallback_);
     balls_drawn_ = 0;
     balls_fallback_ = 0;

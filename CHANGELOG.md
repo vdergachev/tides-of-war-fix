@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.19.0
+
+- The minimap scrolls smoothly: terrain, ships and ports move between game steps instead of jumping, also at full sail
+  (`[smooth_radar]`).
+- Heading and wind pointers on the minimap turn smoothly (`[smooth_radar] pointers`).
+- If the minimap cannot be captured exactly, the original image is shown.
+
 ## 0.18.0
 
 - Small boats (launches and canoes) move smoothly with the scene and are drawn sharp like ships.
