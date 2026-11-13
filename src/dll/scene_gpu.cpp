@@ -884,6 +884,7 @@ void SceneCompositor::update(ID3D11Device *device, ID3D11DeviceContext *context,
         out->step = queue_.input_->step;
         out->count = queue_.input_->count;
         out->follow = queue_.input_->follow;
+        out->night = queue_.input_->night;
         out->camera = queue_.input_->camera;
         out->view = queue_.input_->view;
         out->qpc = (double)queue_.input_->qpc;
@@ -1159,6 +1160,7 @@ void SceneCompositor::draw_base(ID3D11DeviceContext *context, const SceneEntry *
         wake_->bind(context, constants + 16);
         constants[20] = (FLOAT)entry->camera.x;
         constants[21] = (FLOAT)entry->camera.y;
+        constants[22] = (FLOAT)entry->night;
     }
     RECT physical = {0, 0, (LONG)width, (LONG)height};
     ID3D11ShaderResourceView *base_views[] = {
@@ -1466,7 +1468,7 @@ int SceneCompositor::draw(ID3D11DeviceContext *context, UINT width, UINT height,
         }
         wake_ready_ =
             wake_->update(context, entry->view, entry->camera, camera, poses, pose_count, entry->follow,
-                          entry->wake_bottom.get(), display / frequency_, reason != 0);
+                          entry->wake_bottom.get(), display / frequency_, reason != 0, entry->night != 0);
     }
     draw_base(context, entry, reason ? entry : before, camera, shift, width, height);
     double positions[SCENE_SHIPS][2] = {{0}};

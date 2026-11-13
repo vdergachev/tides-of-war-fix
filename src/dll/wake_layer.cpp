@@ -209,10 +209,10 @@ void WakeLayer::bubbles(RECT view, POINT camera, const WORD *bottom, double stam
 
 bool WakeLayer::update(ID3D11DeviceContext *context, RECT view, POINT captured_camera, const double *camera,
                        const WakePose *poses, unsigned count, unsigned follow, const WORD *bottom,
-                       double stamp, bool snap)
+                       double stamp, bool snap, bool night)
 {
     double started = ticks();
-    if (!simulate(view, captured_camera, camera, poses, count, follow, bottom, stamp, snap) ||
+    if (!simulate(view, captured_camera, camera, poses, count, follow, bottom, stamp, snap, night) ||
         !upload(context)) {
         return false;
     }
@@ -222,7 +222,8 @@ bool WakeLayer::update(ID3D11DeviceContext *context, RECT view, POINT captured_c
 }
 
 bool WakeLayer::simulate(RECT view, POINT captured_camera, const double *camera, const WakePose *poses,
-                         unsigned count, unsigned follow, const WORD *bottom, double stamp, bool snap)
+                         unsigned count, unsigned follow, const WORD *bottom, double stamp, bool snap,
+                         bool night)
 {
     /* Match deque expiry before emission, including its per-ship insertion order. */
     while (alive_ && stamp - particles_[start_].born >= 1.33) {
@@ -245,7 +246,9 @@ bool WakeLayer::simulate(RECT view, POINT captured_camera, const double *camera,
             for (unsigned i = 0; i < count; ++i) {
                 const WakePose &pose = poses[i];
                 const History *old = find(pose);
-                if (pose.id == follow || !old || hypot(pose.x - old->pose.x, pose.y - old->pose.y) > 32) {
+                /* The game supplies the followed ship's ripple only by day. */
+                if ((!night && pose.id == follow) || !old ||
+                    hypot(pose.x - old->pose.x, pose.y - old->pose.y) > 32) {
                     continue;
                 }
                 double x = old->pose.x + fraction * (pose.x - old->pose.x);

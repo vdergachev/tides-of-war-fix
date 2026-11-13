@@ -25,6 +25,7 @@ struct SceneEntry {
     unsigned step;
     unsigned count;
     unsigned follow;
+    int night;
     POINT camera;
     RECT view;
     double qpc;

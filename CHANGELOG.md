@@ -6,6 +6,8 @@
   (`[smooth_radar]`).
 - Heading and wind pointers on the minimap turn smoothly (`[smooth_radar] pointers`).
 - If the minimap cannot be captured exactly, the original image is shown.
+- Night missions: your own ship leaves a wake too (the original draws none at night), and wakes no longer flicker
+  with small bright rectangles on dark water. Daytime wakes are unchanged.
 
 ## 0.18.0
 

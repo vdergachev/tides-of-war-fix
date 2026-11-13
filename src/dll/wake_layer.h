@@ -26,7 +26,7 @@ class WakeLayer
     void reset();
     bool update(ID3D11DeviceContext *context, RECT view, POINT captured_camera, const double *camera,
                 const WakePose *poses, unsigned count, unsigned follow, const WORD *bottom, double stamp,
-                bool snap);
+                bool snap, bool night);
     void bind(ID3D11DeviceContext *context, float *constants);
 
     ID3D11PixelShader *shader() const
@@ -59,7 +59,7 @@ class WakeLayer
     };
 
     bool simulate(RECT view, POINT captured_camera, const double *camera, const WakePose *poses,
-                  unsigned count, unsigned follow, const WORD *bottom, double stamp, bool snap);
+                  unsigned count, unsigned follow, const WORD *bottom, double stamp, bool snap, bool night);
     bool upload(ID3D11DeviceContext *context);
     bool texture(ID3D11Device *device, Texture2D &out, UINT width, UINT height, DXGI_FORMAT format);
     const History *find(const WakePose &pose);

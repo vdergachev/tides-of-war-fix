@@ -14,17 +14,19 @@
 #include "smooth_radar.h"
 
 /* Scene capture for smoothing, supported image only. All offsets are observation-only. */
-#define CLOUD_CALL_ADDRESS     0x43ae82
-#define CLOUD_ADDRESS          0x43dbe0
-#define CLOUD_FLAGS_ADDRESS    0x4cde38
-#define CLOUD_STATE            0x1430
-#define CLOUD_STRIDE           0x38
-#define CLOUD_KEY_BITMAP       0x584
-#define CLOUD_BLEND_BITMAP     0xcd4
-#define CLOUD_BITMAP_STRIDE    0x68
-#define DRAW_STATE_ADDRESS     0x4cde48
-#define FRAME_ADDRESS          0x4cde34
-#define CAMERA_ADDRESS         0x4cdde8
+#define CLOUD_CALL_ADDRESS  0x43ae82
+#define CLOUD_ADDRESS       0x43dbe0
+#define CLOUD_FLAGS_ADDRESS 0x4cde38
+#define CLOUD_STATE         0x1430
+#define CLOUD_STRIDE        0x38
+#define CLOUD_KEY_BITMAP    0x584
+#define CLOUD_BLEND_BITMAP  0xcd4
+#define CLOUD_BITMAP_STRIDE 0x68
+#define DRAW_STATE_ADDRESS  0x4cde48
+#define FRAME_ADDRESS       0x4cde34
+#define CAMERA_ADDRESS      0x4cdde8
+/* Water_DrawRipple suppresses the original ripple when this night flag is set. */
+#define NIGHT_ADDRESS          0x4cdd70
 #define GAME_TABLE_ADDRESS     0x4cddd8
 #define PASS_ADDRESS           0x455d90
 #define HULL_CALL_ADDRESS      0x43adbb
@@ -227,6 +229,7 @@ static void __stdcall observe_enter(const DWORD *saved)
                 g_work->camera = *(POINT *)args[2];
             }
             g_work->follow = *(WORD *)(camera + CAMERA_FOLLOW);
+            g_work->night = *(BYTE *)NIGHT_ADDRESS != 0;
             RECT v = g_work->view;
             g_work->valid = v.left >= 0 && v.top >= 0 && v.right <= SCENE_WIDTH && v.bottom <= SCENE_HEIGHT &&
                             v.right > v.left + 16 && v.bottom > v.top + 16;

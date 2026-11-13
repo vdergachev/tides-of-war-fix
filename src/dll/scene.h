@@ -94,6 +94,7 @@ typedef struct {
     unsigned step;
     unsigned count;
     unsigned follow;
+    int night;
     unsigned layers;
     int valid;
     POINT camera;
